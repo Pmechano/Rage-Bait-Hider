@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         Rage Bait Hider · B站评论与弹幕
 // @namespace    local.rage-bait-hider
-// @version      0.2.0
+// @version      0.2.1
+// @updateURL    https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
+// @downloadURL  https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @description  Jev 单问题过滤：先隐藏，判断通过后显示。支持新旧评论区及普通视频弹幕。
 // @match        https://www.bilibili.com/*
 // @run-at       document-start

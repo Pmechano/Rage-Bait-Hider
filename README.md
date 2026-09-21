@@ -1,17 +1,23 @@
-# Rage Bait Hider（油猴试用版 v0.2.0）
+# Rage Bait Hider（油猴试用版 v0.2.1）
 
 在 B 站普通视频页自动过滤评论、楼中楼和普通弹幕。使用 Jev 的一个 `should_hide` 含义的是非判断，默认概率达到 **0.30** 就隐藏。未完成判断、判断缺失、网络失败的内容也保持隐藏。
 
 ## 安装
 
 1. 安装并启用 Tampermonkey。如果浏览器提示，请开启 Tampermonkey 所需的“允许运行用户脚本”权限。
-2. 在 Tampermonkey 中选择“添加新脚本”，把 `rage-bait-hider.user.js` 的完整内容复制进去，替换默认模板并保存。
+2. 点击[安装脚本](https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js)，在 Tampermonkey 中确认安装。如果浏览器只显示源码，可选择“添加新脚本”，复制完整内容替换默认模板并保存。
 3. 刷新一个 B 站普通视频页。右下角会出现“净”按钮与设置面板。
-4. 点击 **导入 Key 文件**，选择本目录中已有的 `jevapi.txt`，然后点击 **保存并应用**。也可以粘贴 Key；“测试连接”会发出一次小额真实 API 请求。
+4. 粘贴你自己的 Jev API Key，或点击 **导入 Key 文件** 选择本地保存 Key 的文本文件，然后点击 **保存并应用**。“测试连接”会发出一次小额真实 API 请求。
 
 脚本安装后不能自行读取电脑上的文件，所以首次需要通过文件选择器导入。Key 不在可分享的脚本中，只保存在 Tampermonkey 的脚本存储里；不要分享 `jevapi.txt` 或含 Key 的油猴备份。
 
 从旧版升级：在 Tampermonkey 中打开已安装的脚本，用本版完整内容替换并保存，再刷新视频页。脚本名称与存储标识未变，已保存的 Key 和设置会保留。
+
+## 自动更新
+
+从 v0.2.1 起，脚本的 `@updateURL` 和 `@downloadURL` 指向本仓库 `main` 分支的原始脚本文件。开启 Tampermonkey 的脚本更新检查后，会按检查周期获取新版；也可以手动检查更新。更新后刷新视频页即可运行新版。
+
+此前通过复制源码安装的版本，需要先手动升级一次到 v0.2.1，才能获得更新地址。后续发布时，修改脚本、提高 `@version` 并推送到 `main`；仅推送代码但不提高版本号不会触发正常的版本更新。更新检查需能访问 `raw.githubusercontent.com`。
 
 ## 使用
 
