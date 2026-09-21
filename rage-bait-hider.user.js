@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rage Bait Hider · B站评论与弹幕
 // @namespace    local.rage-bait-hider
-// @version      0.3.1
+// @version      0.3.2
 // @updateURL    https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @downloadURL  https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @description  Jev 单问题过滤：先隐藏，判断通过后显示。支持新旧评论区及普通视频弹幕。
@@ -22,7 +22,7 @@
 
   const POLICY = '包含以下任意一种就属于应屏蔽内容：引战挑衅、煽动群体对立、阴阳怪气、贬损性嘲讽、人身攻击、拉踩炫耀优越感、空洞叫嚣、无意义灌水或刷烂梗。正常讨论、真诚提问、信息分享、具体且就事论事的批评、友善玩笑以及与视频有关的普通情绪表达不属于屏蔽内容。';
   const DEFAULTS = { enabled: true, comments: true, danmaku: true, debug: false, threshold: 0.3, policy: POLICY, apiKey: '' };
-  const blockedEmote = text => /\[(星星眼|呲牙|喜极而泣)\]/.exec(text)?.[0] || '';
+  const blockedEmote = text => /\[(星星眼|呲牙|喜极而泣|打call)\]/.exec(text)?.[0] || '';
   const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const validProbability = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
@@ -122,7 +122,7 @@
   const settings = Object.assign({}, DEFAULTS, GM_getValue('rbh.settings.v1', {}));
   if (!Number.isFinite(settings.threshold) || settings.threshold < 0 || settings.threshold > 1) settings.threshold = 0.3;
   const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
-  const CUSTOM = 'bili-comments,bili-comment-thread-renderer,bili-comment-replies-renderer,bili-comment-renderer,bili-comment-reply-renderer,bili-rich-text,bili-user-profile';
+  const CUSTOM = 'bili-comments,bili-comment-thread-renderer,bili-comment-replies-renderer,bili-comment-renderer,bili-comment-reply-renderer,bili-rich-text';
   const CANDIDATES = 'bili-comment-renderer,bili-comment-reply-renderer,.reply-item,.sub-reply-item,.reply-wrap:not(:has(.reply-item))';
   // Native DOM selectors verified against Bilibili-Evolved (see README references).
   const DM_CONTAINERS = '.bpx-player-row-dm-wrap,.bpx-player-dm-wrap,.bpx-player-dm-container,.bilibili-player-video-danmaku';
@@ -352,15 +352,16 @@
     if (node.matches?.('br')) return ' ';
     return Array.from((node.shadowRoot || node).childNodes).map(richText).join('');
   }
-  function textOf(candidate) {
+  function commentContent(candidate) {
     const scope = candidate.shadowRoot || candidate;
     if (candidate.tagName.startsWith('BILI-')) {
-      const content = scope.querySelector('#content bili-rich-text,#main bili-rich-text,bili-rich-text,#content');
-      return normalize(richText(content));
+      return scope.querySelector('#content bili-rich-text,#main bili-rich-text,bili-rich-text') || scope.querySelector('#content');
     }
-    const content = [...scope.querySelectorAll('.reply-content,.text,.reply-text')]
+    return [...scope.querySelectorAll('.reply-content,.text,.reply-text')]
       .find(el => el.closest(CANDIDATES) === candidate);
-    return normalize(richText(content));
+  }
+  function textOf(candidate) {
+    return normalize(richText(commentContent(candidate)));
   }
   function composedParent(node, selector) {
     for (let current = node; current;) {
@@ -409,29 +410,21 @@
     if (element.matches('.reply-item,.reply-wrap') && !element.matches('.sub-reply-item')) return element;
     return null;
   }
-  function commentNickname(element) {
-    const scope = element.shadowRoot || element;
-    const selectors = '#user-name,.user-name,.sub-user-name,.name,#name';
-    const own = node => composedParent(node, CANDIDATES) === element;
-    const profile = [...scope.querySelectorAll('bili-user-profile')].find(own);
-    const innerName = profile?.shadowRoot?.querySelector(selectors);
-    if (innerName) return innerName;
-    return [...scope.querySelectorAll(selectors)].find(own) || profile;
-  }
   function updateCommentDebug(record, state) {
     if (!settings.debug || !['allowed', 'revealed'].includes(state)) { record.badge?.remove(); return; }
-    const name = commentNickname(record.element);
-    if (!name?.parentNode) { record.badge?.remove(); return; }
+    const content = commentContent(record.element);
+    const target = content?.shadowRoot ? content.shadowRoot.querySelector('#contents') || content.shadowRoot : content;
+    if (!target) { record.badge?.remove(); return; }
     if (!record.badge) {
       record.badge = document.createElement('span'); record.badge.dataset.rbhDebug = 'true';
-      record.badge.style.cssText = 'display:inline-block;margin-left:6px;font:12px/1.4 monospace;color:#147d70;white-space:nowrap;';
+      record.badge.style.cssText = 'display:inline-block;margin-left:6px;font:12px/1.4 monospace;color:#888!important;white-space:nowrap;';
     }
     const label = validProbability(record.probability) ? `Jev: ${record.probability}`
       : record.reason ? 'Jev: 未调用（表情规则）' : !parentApproved(record.element) ? 'Jev: 未调用（等待主评论通过）'
         : record.probability === null ? 'Jev: 判断失败' : 'Jev: 待判断';
     if (record.badge.textContent !== label) record.badge.textContent = label;
     record.badge.title = record.reason || 'Jev 返回的屏蔽概率；越高越倾向屏蔽。缓存命中时显示缓存值。';
-    if (name.nextSibling !== record.badge) name.after(record.badge);
+    if (target.lastChild !== record.badge) target.append(record.badge);
   }
   function applyComment(record) {
     let state;
@@ -700,7 +693,7 @@
         <input id="file" type="file" accept=".txt,.json" hidden>
         <label><input id="comments" type="checkbox"> 过滤评论及楼中楼</label>
         <label><input id="danmaku" type="checkbox"> 过滤弹幕（保留原生显示与设置）</label>
-        <label><input id="debug" type="checkbox"> Debug：在昵称右侧显示 Jev 屏蔽概率</label>
+        <label><input id="debug" type="checkbox"> Debug：在评论末尾用灰字显示 Jev 屏蔽概率</label>
         <label>隐藏阈值 <input id="threshold" type="range" min="0.05" max="0.95" step="0.05"><output id="threshold-value"></output><small>越低越严格。默认 0.30；未完成判断的内容先隐藏。</small></label>
         <details><summary>屏蔽标准</summary><textarea id="policy"></textarea><button id="default-policy">恢复默认标准</button></details>
         <p><button id="save" class="primary">保存并应用</button></p>

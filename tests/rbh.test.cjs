@@ -92,7 +92,7 @@ window.addModern = function(text, isReply = false) {
  if(!thread){thread=document.createElement('bili-comment-thread-renderer');thread.attachShadow({mode:'open'});root.append(thread);}
  const item = document.createElement(isReply ? 'bili-comment-reply-renderer' : 'bili-comment-renderer');
  const inner = item.attachShadow({mode:'open'});const profile=document.createElement('bili-user-profile');profile.attachShadow({mode:'open'}).innerHTML='<span id="name">昵称</span>';inner.append(profile);const body=document.createElement('div');body.id=isReply?'main':'content';
- const rich=document.createElement('bili-rich-text');const r=rich.attachShadow({mode:'open'});const span=document.createElement('span');span.textContent=text;r.append(span);body.append(rich);inner.append(body);thread.shadowRoot.append(item);return item;
+ const rich=document.createElement('bili-rich-text');const r=rich.attachShadow({mode:'open'});const contents=document.createElement('div');contents.id='contents';const span=document.createElement('span');span.textContent=text;contents.append(span);r.append(contents);body.append(rich);inner.append(body);thread.shadowRoot.append(item);return item;
 };
 window.modernGood=addModern('这是正常的一级评论');window.modernBad=addModern('恶意回复',true);
 Object.defineProperty(document.querySelector('video'),'currentTime',{configurable:true,get(){return window.fakeTime||0;}});
@@ -144,12 +144,12 @@ async function setup(options = {}) {
   return { page, errors };
 }
 
-test('browser: three emotes bypass Jev for text, image alt and native danmaku', { skip: !browserEnabled }, async () => {
+test('browser: four emotes bypass Jev for text, image alt and native danmaku', { skip: !browserEnabled }, async () => {
   const { page, errors } = await setup({ danmaku: true });
   try {
     await page.waitForFunction(() => document.querySelector('#good').dataset.rbhState === 'allowed');
     await page.evaluate(() => {
-      for (const [index, emote] of ['[星星眼]', '[呲牙]', '[喜极而泣]'].entries()) {
+      for (const [index, emote] of ['[星星眼]', '[呲牙]', '[喜极而泣]', '[打call]'].entries()) {
         const comment = document.createElement('div'); comment.className = 'reply-item'; comment.id = `emote-${index}`;
         comment.innerHTML = `<span class="user-name">用户</span><div class="reply-content">正常文字<img alt="${emote}"></div>`;
         document.querySelector('#commentapp').append(comment);
@@ -157,13 +157,13 @@ test('browser: three emotes bypass Jev for text, image alt and native danmaku', 
         document.querySelector('.native-wrapper').append(dm);
       }
       document.querySelector('#good .reply-content').textContent = '谢谢分享[呲牙]';
-      window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '一级评论[星星眼]';
+      window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '一级评论[打call]';
     });
-    await page.waitForFunction(() => [0, 1, 2].every(i => document.querySelector(`#emote-${i}`).dataset.rbhState === 'blocked' && document.querySelector(`#dm-emote-${i}`).dataset.rbhDm === 'hidden'));
+    await page.waitForFunction(() => [0, 1, 2, 3].every(i => document.querySelector(`#emote-${i}`).dataset.rbhState === 'blocked' && document.querySelector(`#dm-emote-${i}`).dataset.rbhDm === 'hidden'));
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked' && document.querySelector('#good').dataset.rbhState === 'blocked');
     await page.waitForTimeout(500);
     assert.equal(await page.locator('#good').isVisible(), false);
-    const leaked = await page.evaluate(() => window.__requests.flatMap(r => Object.values(r.body?.state.items || {})).filter(item => /\[(星星眼|呲牙|喜极而泣)\]/.test(item.target_text + item.parent_comment)));
+    const leaked = await page.evaluate(() => window.__requests.flatMap(r => Object.values(r.body?.state.items || {})).filter(item => /\[(星星眼|呲牙|喜极而泣|打call)\]/.test(item.target_text + item.parent_comment)));
     assert.deepEqual(leaked, []);
     await page.evaluate(() => { window.__ui.querySelector('#history-button').click(); });
     assert.match(await page.evaluate(() => window.__ui.querySelector('#history').textContent), /表情规则/);
@@ -264,26 +264,39 @@ test('browser: queued replies are discarded when their root changes, then resume
   } finally { await page.close(); }
 });
 
-test('browser: debug scores appear beside each nickname without extra requests or mutation loops', { skip: !browserEnabled }, async () => {
+test('browser: grey debug scores follow comment text without nicknames, extra requests or mutation loops', { skip: !browserEnabled }, async () => {
   const { page, errors } = await setup();
   try {
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'allowed');
     await page.evaluate(() => { window.safeDebugReply = addModern('友好的调试回复', true); });
     await page.waitForFunction(() => window.safeDebugReply.dataset.rbhState === 'allowed');
     const count = await page.evaluate(() => window.__requests.length);
-    await page.evaluate(() => { const debug = window.__ui.querySelector('#debug'); debug.checked = true; debug.dispatchEvent(new Event('change')); });
-    assert.equal(await page.locator('#good .user-name + [data-rbh-debug]').textContent(), 'Jev: 0.01');
-    assert.equal(await page.evaluate(() => window.modernGood.shadowRoot.querySelector('bili-user-profile').shadowRoot.querySelector('#name').nextElementSibling.textContent), 'Jev: 0.01');
-    assert.equal(await page.evaluate(() => window.safeDebugReply.shadowRoot.querySelector('bili-user-profile').shadowRoot.querySelector('#name').nextElementSibling.textContent), 'Jev: 0.01');
+    await page.evaluate(() => {
+      document.querySelector('#good .user-name').remove();
+      window.modernGood.shadowRoot.querySelector('bili-user-profile').remove();
+      window.safeDebugReply.shadowRoot.querySelector('bili-user-profile').remove();
+      const debug = window.__ui.querySelector('#debug'); debug.checked = true; debug.dispatchEvent(new Event('change'));
+    });
+    await page.waitForFunction(() => document.querySelector('#good .reply-content [data-rbh-debug]')
+      && window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('#contents [data-rbh-debug]')
+      && window.safeDebugReply.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('#contents [data-rbh-debug]'));
+    assert.equal(await page.locator('#good .reply-content [data-rbh-debug]').textContent(), 'Jev: 0.01');
+    assert.equal(await page.evaluate(() => window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('#contents').lastElementChild.textContent), 'Jev: 0.01');
+    assert.equal(await page.evaluate(() => window.safeDebugReply.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('#contents').lastElementChild.textContent), 'Jev: 0.01');
+    assert.equal(await page.locator('#good [data-rbh-debug]').evaluate(el => getComputedStyle(el).color), 'rgb(136, 136, 136)');
+    assert.equal(await page.locator('#good .reply-content [data-rbh-debug]').isVisible(), true);
+    assert.equal(await page.locator('bili-comment-renderer bili-rich-text [data-rbh-debug]').isVisible(), true);
+    assert.equal(await page.locator('bili-comment-reply-renderer bili-rich-text [data-rbh-debug]').isVisible(), true);
     assert.equal(await page.locator('#bad [data-rbh-debug]').count(), 0);
     assert.equal(await page.evaluate(() => window.__stored['rbh.settings.v1'].debug), true);
-    // A profile re-render should reattach one badge without changing the judged text.
-    await page.evaluate(() => { window.modernGood.shadowRoot.querySelector('bili-user-profile').shadowRoot.innerHTML = '<span id="name">新的昵称</span>'; });
-    await page.waitForFunction(() => window.modernGood.shadowRoot.querySelector('bili-user-profile').shadowRoot.querySelector('[data-rbh-debug]'));
+    // A content re-render should reattach one badge without changing the judged text.
+    await page.evaluate(() => { window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('#contents').innerHTML = '<span>这是正常的一级评论</span>'; });
+    await page.waitForFunction(() => window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('#contents [data-rbh-debug]'));
     await page.waitForTimeout(1300);
     assert.equal(await page.evaluate(() => window.__requests.length), count);
     assert.equal(await page.locator('#good [data-rbh-debug]').count(), 1);
     assert.equal(await page.locator('#good').getAttribute('data-rbh-state'), 'allowed');
+    assert.equal(await page.evaluate(() => window.__requests.some(r => Object.values(r.body?.state.items || {}).some(item => (item.target_text + item.parent_comment).includes('Jev:')))), false);
     await page.evaluate(() => { const debug = window.__ui.querySelector('#debug'); debug.checked = false; debug.dispatchEvent(new Event('change')); });
     assert.equal(await page.locator('[data-rbh-debug]').count(), 0);
     assert.deepEqual(errors, []);
