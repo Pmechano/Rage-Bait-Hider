@@ -1,0 +1,4 @@
+jevapi.txt
+*.private.user.js
+node_modules/
+test-results/
