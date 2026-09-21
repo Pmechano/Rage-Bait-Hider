@@ -184,7 +184,7 @@ test('browser: blocked roots hide replies and expand controls in legacy and Shad
       window.modernExpand = document.createElement('button'); window.modernExpand.textContent = '共 8 条回复，点击查看';
       window.modernGood.getRootNode().append(window.modernExpand);
     });
-    await page.waitForFunction(() => window.safeReply.dataset.rbhState === 'allowed' && document.querySelector('#legacy-child').dataset.rbhState === 'allowed');
+    await page.waitForFunction(() => window.safeReply.dataset.rbhState === 'allowed' && document.querySelector('#legacy-child').dataset.rbhState === 'pending');
     assert.equal(await page.locator('#legacy-child').isVisible(), false);
     assert.equal(await page.locator('#legacy-expand').isVisible(), false);
     const hiddenBeforePaint = await page.evaluate(async () => {
@@ -193,11 +193,15 @@ test('browser: blocked roots hide replies and expand controls in legacy and Shad
       return getComputedStyle(window.modernGood.getRootNode().host).display === 'none';
     });
     assert.equal(hiddenBeforePaint, true);
-    await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked' && window.safeReply.dataset.rbhState === 'allowed');
+    await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked' && window.safeReply.dataset.rbhState === 'pending');
     assert.equal(await page.locator('bili-comment-thread-renderer button').isVisible(), false);
     assert.equal(await page.evaluate(() => window.safeReply.getBoundingClientRect().height), 0);
     await page.evaluate(() => { window.lateSafeReply = addModern('后来加载的正常回复', true); });
-    await page.waitForFunction(() => window.lateSafeReply.dataset.rbhState === 'allowed');
+    await page.waitForFunction(() => window.lateSafeReply.dataset.rbhState === 'pending');
+    await page.waitForTimeout(800);
+    const sent = await page.evaluate(() => window.__requests.flatMap(r => Object.values(r.body?.state.items || {})));
+    assert.equal(sent.some(item => ['正常的楼中回复', '后来加载的正常回复'].includes(item.target_text)), false);
+    assert.equal(sent.some(item => item.parent_comment === '恶意主评论'), false);
     assert.equal(await page.evaluate(() => window.lateSafeReply.getBoundingClientRect().height), 0);
     // An unrecognisable replacement must not retain the old root's approval.
     await page.evaluate(() => { window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = ''; });
@@ -206,6 +210,56 @@ test('browser: blocked roots hide replies and expand controls in legacy and Shad
     await page.evaluate(() => { const toggle = window.__ui.querySelector('#reveal'); toggle.checked = true; toggle.dispatchEvent(new Event('change')); });
     assert.equal(await page.locator('bili-comment-thread-renderer button').isVisible(), true);
     assert.equal(await page.locator('#legacy-expand').isVisible(), true);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: replies are submitted only after their root verdict, and cached roots still unlock replies', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup({ apiDelay: 700 });
+  try {
+    await page.waitForFunction(() => window.__requests.some(r => r.body));
+    assert.equal(await page.evaluate(() => window.__requests.some(r => Object.values(r.body?.state.items || {}).some(item => item.target_text === '恶意回复'))), false);
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    const batches = await page.evaluate(() => window.__requests.filter(r => r.body).map(r => Object.values(r.body.state.items).map(item => item.target_text)));
+    assert.ok(batches.findIndex(items => items.includes('恶意回复')) > batches.findIndex(items => items.includes('这是正常的一级评论')));
+    const count = await page.evaluate(() => window.__requests.length);
+    await page.evaluate(() => { window.__ui.querySelector('#retry').click(); });
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    assert.equal(await page.evaluate(() => window.__requests.length), count);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: failed or unidentifiable roots never submit their loaded replies', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup({ malformed: true, apiDelay: 500 });
+  try {
+    await page.evaluate(() => {
+      const child = document.createElement('div'); child.id = 'failed-parent-child'; child.className = 'sub-reply-item'; child.innerHTML = '<div class="reply-content">失败主评论下的回复</div>'; document.querySelector('#good').append(child);
+      const orphan = document.createElement('div'); orphan.className = 'sub-reply-item'; orphan.innerHTML = '<div class="reply-content">找不到主评论的回复</div>'; document.querySelector('#commentapp').append(orphan);
+    });
+    await page.waitForFunction(() => document.querySelector('#good').dataset.rbhState === 'error' && window.modernBad.dataset.rbhState === 'blocked');
+    await page.waitForTimeout(800);
+    const sent = await page.evaluate(() => window.__requests.flatMap(r => Object.values(r.body?.state.items || {})).map(item => item.target_text));
+    assert.equal(sent.includes('失败主评论下的回复'), false);
+    assert.equal(sent.includes('找不到主评论的回复'), false);
+    assert.equal(await page.locator('#failed-parent-child').isVisible(), false);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: queued replies are discarded when their root changes, then resume after approval', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    await page.evaluate(() => { window.queuedReply = addModern('尚未发送的排队回复', true); });
+    await page.waitForFunction(() => window.queuedReply.dataset.rbhState === 'pending');
+    await page.evaluate(() => { window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '恶意替换的主评论'; });
+    await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked');
+    await page.waitForTimeout(800);
+    assert.equal(await page.evaluate(() => window.__requests.some(r => Object.values(r.body?.state.items || {}).some(item => item.target_text === '尚未发送的排队回复'))), false);
+    await page.evaluate(() => { window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '这是正常的一级评论'; });
+    await page.waitForFunction(() => window.queuedReply.dataset.rbhState === 'allowed');
+    assert.equal(await page.evaluate(() => window.__requests.flatMap(r => Object.values(r.body?.state.items || {})).filter(item => item.target_text === '尚未发送的排队回复').length), 1);
     assert.deepEqual(errors, []);
   } finally { await page.close(); }
 });

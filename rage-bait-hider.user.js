@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rage Bait Hider · B站评论与弹幕
 // @namespace    local.rage-bait-hider
-// @version      0.3.0
+// @version      0.3.1
 // @updateURL    https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @downloadURL  https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @description  Jev 单问题过滤：先隐藏，判断通过后显示。支持新旧评论区及普通视频弹幕。
@@ -197,17 +197,24 @@
     clearTimeout(flushTimer);
     flushTimer = setTimeout(flush, Math.max(100, nextRequestAt - Date.now()));
   }
-  async function evaluate(item) {
+  async function evaluate(item, eligible = () => true) {
     const epoch = generation, key = await cacheKey(item);
-    if (epoch !== generation) return null;
+    if (epoch !== generation || !eligible()) return undefined;
     const cached = scoreCache.get(key);
     if (cached?.expires > Date.now() && validProbability(cached.probability)) { cacheHits++; return cached.probability; }
-    if (jobs.has(key)) return jobs.get(key).promise;
+    if (jobs.has(key)) { const job = jobs.get(key); job.guards.add(eligible); return job.promise; }
     let resolve;
     const promise = new Promise(r => { resolve = r; });
-    const job = { key, item, promise, resolve, epoch, done: false };
+    const job = { key, item, promise, resolve, epoch, done: false, guards: new Set([eligible]) };
     jobs.set(key, job); queue.push(job); scheduleFlush();
     return promise;
+  }
+  function jobEligible(job) {
+    return job.epoch === generation && [...job.guards].some(guard => guard());
+  }
+  function cancelJob(job) {
+    if (jobs.get(job.key) === job) jobs.delete(job.key);
+    job.resolve(undefined); // Cancellation is not a model failure or a cacheable verdict.
   }
   async function flush() {
     if (!filtering() || !settings.apiKey || fatalError || activeRequests >= 2 || !queue.length) return;
@@ -224,17 +231,23 @@
       const job = queue[0], size = job.item.text.length + (job.item.parent || '').length;
       if (batch.length && chars + size > 16000) break;
       queue.shift();
-      if (job.epoch !== generation) { job.resolve(null); continue; }
+      if (!jobEligible(job)) { cancelJob(job); continue; }
       batch.push(job); chars += size;
     }
     if (!batch.length) return;
-    const epoch = generation, body = buildRequest(title, batch.map(job => job.item), settings.policy);
+    const epoch = generation;
     activeRequests++; nextRequestAt = Date.now() + 600;
     if (queue.length) scheduleFlush();
     try {
       let data;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (epoch !== generation) return;
+        // Recheck immediately before sending, including retries after rate limiting.
+        for (let index = batch.length - 1; index >= 0; index--) {
+          if (!jobEligible(batch[index])) cancelJob(batch.splice(index, 1)[0]);
+        }
+        if (!batch.length) return;
+        const body = buildRequest(title, batch.map(job => job.item), settings.policy);
         requestCount++;
         const response = await request({ method: 'POST', url: ENDPOINT, anonymous: true,
           headers: { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }, data: JSON.stringify(body) });
@@ -356,16 +369,40 @@
     }
     return null;
   }
-  function parentText(candidate) {
+  function parentComment(candidate) {
     if (candidate.matches('bili-comment-reply-renderer')) {
       const thread = composedParent(candidate, 'bili-comment-thread-renderer');
-      return textOf(thread?.shadowRoot?.querySelector('bili-comment-renderer') || document.createElement('div'));
+      return (thread?.shadowRoot || thread)?.querySelector('bili-comment-renderer') || null;
     }
     if (candidate.matches('.sub-reply-item')) {
-      const root = candidate.parentElement?.closest('.reply-item,.reply-wrap');
-      return root ? textOf(root) : '';
+      return candidate.parentElement?.closest('.reply-item,.reply-wrap') || null;
     }
-    return '';
+    return null;
+  }
+  function parentText(candidate) {
+    const parent = parentComment(candidate);
+    return parent ? textOf(parent) : '';
+  }
+  function parentApproved(element) {
+    if (!element.matches('bili-comment-reply-renderer,.sub-reply-item')) return true;
+    const parent = parentComment(element), record = commentRecords.get(parent);
+    return !!(parent?.isConnected && record && record.epoch === generation && !record.reason
+      && record.text === textOf(parent) && !shouldHide(record.probability, settings.threshold));
+  }
+  function commentEligible(record) {
+    return filtering() && settings.comments && record.element.isConnected && record.epoch === generation
+      && commentRecords.get(record.element) === record && pageKey() === route && currentTitle() === title
+      && record.text === textOf(record.element) && record.parent === parentText(record.element) && parentApproved(record.element);
+  }
+  function evaluateComment(record) {
+    if (record.inFlight || record.probability !== undefined || !commentEligible(record)) return;
+    record.inFlight = true;
+    engine.evaluate({ type: 'comment', text: record.text, parent: record.parent }, () => commentEligible(record)).then(probability => {
+      record.inFlight = false;
+      if (record.epoch !== generation || commentRecords.get(record.element) !== record) return;
+      if (commentEligible(record)) record.probability = probability;
+      applyComment(record); scheduleScan(); renderStatus();
+    });
   }
   function commentThread(element) {
     if (element.matches('bili-comment-renderer')) return composedParent(element, 'bili-comment-thread-renderer');
@@ -390,7 +427,8 @@
       record.badge.style.cssText = 'display:inline-block;margin-left:6px;font:12px/1.4 monospace;color:#147d70;white-space:nowrap;';
     }
     const label = validProbability(record.probability) ? `Jev: ${record.probability}`
-      : record.reason ? 'Jev: 未调用（表情规则）' : record.probability === null ? 'Jev: 判断失败' : 'Jev: 待判断';
+      : record.reason ? 'Jev: 未调用（表情规则）' : !parentApproved(record.element) ? 'Jev: 未调用（等待主评论通过）'
+        : record.probability === null ? 'Jev: 判断失败' : 'Jev: 待判断';
     if (record.badge.textContent !== label) record.badge.textContent = label;
     record.badge.title = record.reason || 'Jev 返回的屏蔽概率；越高越倾向屏蔽。缓存命中时显示缓存值。';
     if (name.nextSibling !== record.badge) name.after(record.badge);
@@ -400,6 +438,7 @@
     if (!filtering() || !settings.comments || revealed) state = 'revealed';
     else if (pageKey() !== route || currentTitle() !== title || textOf(record.element) !== record.text || parentText(record.element) !== record.parent) state = 'pending';
     else if (record.reason) state = 'blocked';
+    else if (!parentApproved(record.element)) state = 'pending';
     else if (record.probability === undefined) state = 'pending';
     else if (record.probability === null) state = 'error';
     else state = shouldHide(record.probability, settings.threshold) ? 'blocked' : 'allowed';
@@ -437,7 +476,7 @@
         }
         const fingerprint = JSON.stringify([title, text, parent]);
         let record = commentRecords.get(element);
-        if (record?.fingerprint === fingerprint) { applyComment(record); continue; }
+        if (record?.fingerprint === fingerprint) { applyComment(record); evaluateComment(record); continue; }
         record?.badge?.remove();
         record = { element, fingerprint, text, parent, probability: undefined, epoch: generation };
         commentRecords.set(element, record); applyComment(record);
@@ -448,10 +487,7 @@
         if (text.length + parent.length > 12000 || text === '[图片]') {
           record.probability = null; applyComment(record); continue;
         }
-        engine.evaluate({ type: 'comment', text, parent }).then(probability => {
-          if (record.epoch !== generation || commentRecords.get(element) !== record) return;
-          record.probability = probability; applyComment(record); renderStatus();
-        });
+        evaluateComment(record);
       }
     }
     for (const [element, record] of commentRecords) if (!element.isConnected) { record.badge?.remove(); commentRecords.delete(element); }
