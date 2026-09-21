@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rage Bait Hider · B站评论与弹幕
 // @namespace    local.rage-bait-hider
-// @version      0.2.1
+// @version      0.3.0
 // @updateURL    https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @downloadURL  https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @description  Jev 单问题过滤：先隐藏，判断通过后显示。支持新旧评论区及普通视频弹幕。
@@ -21,7 +21,8 @@
   'use strict';
 
   const POLICY = '包含以下任意一种就属于应屏蔽内容：引战挑衅、煽动群体对立、阴阳怪气、贬损性嘲讽、人身攻击、拉踩炫耀优越感、空洞叫嚣、无意义灌水或刷烂梗。正常讨论、真诚提问、信息分享、具体且就事论事的批评、友善玩笑以及与视频有关的普通情绪表达不属于屏蔽内容。';
-  const DEFAULTS = { enabled: true, comments: true, danmaku: true, threshold: 0.3, policy: POLICY, apiKey: '' };
+  const DEFAULTS = { enabled: true, comments: true, danmaku: true, debug: false, threshold: 0.3, policy: POLICY, apiKey: '' };
+  const blockedEmote = text => /\[(星星眼|呲牙|喜极而泣)\]/.exec(text)?.[0] || '';
   const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const validProbability = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
@@ -121,7 +122,7 @@
   const settings = Object.assign({}, DEFAULTS, GM_getValue('rbh.settings.v1', {}));
   if (!Number.isFinite(settings.threshold) || settings.threshold < 0 || settings.threshold > 1) settings.threshold = 0.3;
   const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
-  const CUSTOM = 'bili-comments,bili-comment-thread-renderer,bili-comment-replies-renderer,bili-comment-renderer,bili-comment-reply-renderer,bili-rich-text';
+  const CUSTOM = 'bili-comments,bili-comment-thread-renderer,bili-comment-replies-renderer,bili-comment-renderer,bili-comment-reply-renderer,bili-rich-text,bili-user-profile';
   const CANDIDATES = 'bili-comment-renderer,bili-comment-reply-renderer,.reply-item,.sub-reply-item,.reply-wrap:not(:has(.reply-item))';
   // Native DOM selectors verified against Bilibili-Evolved (see README references).
   const DM_CONTAINERS = '.bpx-player-row-dm-wrap,.bpx-player-dm-wrap,.bpx-player-dm-container,.bilibili-player-video-danmaku';
@@ -138,6 +139,7 @@
     bili-comments:not([data-rbh-ready]),bili-comment-thread-renderer:not([data-rbh-ready]),bili-comment-replies-renderer:not([data-rbh-ready]) { visibility:hidden!important; }
     :is(${CANDIDATES}):not([data-rbh-state]),[data-rbh-state="pending"] { visibility:hidden!important; }
     [data-rbh-state="blocked"],[data-rbh-state="error"] { display:none!important; }
+    [data-rbh-thread]:not([data-rbh-thread="allowed"]):not([data-rbh-thread="revealed"]) { display:none!important; }
     [data-rbh-state="allowed"],[data-rbh-state="revealed"] { visibility:visible!important; }
   `;
   let generation = 0, route = '', title = '', videoMeta = null;
@@ -300,15 +302,22 @@
       let changed = false;
       for (const mutation of mutations) {
         const element = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
-        if (element?.closest?.('[data-rbh-ui],[data-rbh-style]')) continue;
+        if (element?.closest?.('[data-rbh-ui],[data-rbh-style],[data-rbh-debug]')) continue;
+        const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+        if (mutation.type === 'childList' && changedNodes.length && changedNodes.every(node => node.matches?.('[data-rbh-debug]'))) continue;
         changed = true;
         // Recycled nodes must lose their previous approval BEFORE the browser paints.
         const candidate = composedParent(element, CANDIDATES);
-        if (candidate && filtering() && settings.comments && !revealed) candidate.dataset.rbhState = 'pending';
+        if (candidate && filtering() && settings.comments && !revealed) {
+          candidate.dataset.rbhState = 'pending';
+          const thread = commentThread(candidate);
+          if (thread) thread.dataset.rbhThread = 'pending';
+          commentRecords.get(candidate)?.badge?.remove();
+        }
       }
       if (changed) scheduleScan();
     });
-    observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'alt'] });
+    observer.observe(root, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'alt', 'title'] });
     roots.set(root, { style, observer });
   }
   function refreshStyles() {
@@ -325,7 +334,7 @@
     if (!node) return '';
     if (node.nodeType === 3) return node.textContent;
     if (node.nodeType !== 1 && node.nodeType !== 11) return '';
-    if (node.matches?.('style,script,svg,button,[data-rbh-ui]')) return '';
+    if (node.matches?.('style,script,svg,button,[data-rbh-ui],[data-rbh-debug]')) return '';
     if (node.matches?.('img')) return node.getAttribute('alt') || node.getAttribute('title') || '[图片]';
     if (node.matches?.('br')) return ' ';
     return Array.from((node.shadowRoot || node).childNodes).map(richText).join('');
@@ -358,13 +367,46 @@
     }
     return '';
   }
+  function commentThread(element) {
+    if (element.matches('bili-comment-renderer')) return composedParent(element, 'bili-comment-thread-renderer');
+    if (element.matches('.reply-item,.reply-wrap') && !element.matches('.sub-reply-item')) return element;
+    return null;
+  }
+  function commentNickname(element) {
+    const scope = element.shadowRoot || element;
+    const selectors = '#user-name,.user-name,.sub-user-name,.name,#name';
+    const own = node => composedParent(node, CANDIDATES) === element;
+    const profile = [...scope.querySelectorAll('bili-user-profile')].find(own);
+    const innerName = profile?.shadowRoot?.querySelector(selectors);
+    if (innerName) return innerName;
+    return [...scope.querySelectorAll(selectors)].find(own) || profile;
+  }
+  function updateCommentDebug(record, state) {
+    if (!settings.debug || !['allowed', 'revealed'].includes(state)) { record.badge?.remove(); return; }
+    const name = commentNickname(record.element);
+    if (!name?.parentNode) { record.badge?.remove(); return; }
+    if (!record.badge) {
+      record.badge = document.createElement('span'); record.badge.dataset.rbhDebug = 'true';
+      record.badge.style.cssText = 'display:inline-block;margin-left:6px;font:12px/1.4 monospace;color:#147d70;white-space:nowrap;';
+    }
+    const label = validProbability(record.probability) ? `Jev: ${record.probability}`
+      : record.reason ? 'Jev: 未调用（表情规则）' : record.probability === null ? 'Jev: 判断失败' : 'Jev: 待判断';
+    if (record.badge.textContent !== label) record.badge.textContent = label;
+    record.badge.title = record.reason || 'Jev 返回的屏蔽概率；越高越倾向屏蔽。缓存命中时显示缓存值。';
+    if (name.nextSibling !== record.badge) name.after(record.badge);
+  }
   function applyComment(record) {
     let state;
     if (!filtering() || !settings.comments || revealed) state = 'revealed';
+    else if (pageKey() !== route || currentTitle() !== title || textOf(record.element) !== record.text || parentText(record.element) !== record.parent) state = 'pending';
+    else if (record.reason) state = 'blocked';
     else if (record.probability === undefined) state = 'pending';
     else if (record.probability === null) state = 'error';
     else state = shouldHide(record.probability, settings.threshold) ? 'blocked' : 'allowed';
     if (record.element.dataset.rbhState !== state) record.element.dataset.rbhState = state;
+    const thread = commentThread(record.element);
+    if (thread) thread.dataset.rbhThread = state;
+    updateCommentDebug(record, state);
   }
   function scanComments() {
     if (!document.documentElement) return;
@@ -380,18 +422,29 @@
     for (const [root] of roots) {
       for (const host of root.querySelectorAll('bili-comments,bili-comment-thread-renderer,bili-comment-replies-renderer')) {
         if (host.shadowRoot && roots.has(host.shadowRoot)) host.dataset.rbhReady = 'true';
+        if (host.matches('bili-comment-thread-renderer') && !host.hasAttribute('data-rbh-thread')) host.dataset.rbhThread = 'pending';
       }
       if (!filtering() || !settings.comments) continue;
       for (const element of root.querySelectorAll(CANDIDATES)) {
         // Legacy .reply-wrap is sometimes a wrapper around real items, not a comment.
         if (element.matches('.reply-wrap') && element.querySelector('.reply-item')) continue;
         const text = textOf(element), parent = parentText(element);
-        if (!text) continue; // Unknown/image-only structures remain hidden.
+        if (!text) {
+          const previous = commentRecords.get(element); previous?.badge?.remove(); commentRecords.delete(element);
+          element.dataset.rbhState = 'pending';
+          const thread = commentThread(element); if (thread) thread.dataset.rbhThread = 'pending';
+          continue; // Unknown/image-only structures remain hidden with their replies.
+        }
         const fingerprint = JSON.stringify([title, text, parent]);
         let record = commentRecords.get(element);
         if (record?.fingerprint === fingerprint) { applyComment(record); continue; }
+        record?.badge?.remove();
         record = { element, fingerprint, text, parent, probability: undefined, epoch: generation };
         commentRecords.set(element, record); applyComment(record);
+        const emote = blockedEmote(text) || blockedEmote(parent);
+        if (emote) {
+          record.reason = `表情规则：${emote}`; record.probability = null; applyComment(record); continue;
+        }
         if (text.length + parent.length > 12000 || text === '[图片]') {
           record.probability = null; applyComment(record); continue;
         }
@@ -401,7 +454,7 @@
         });
       }
     }
-    for (const [element] of commentRecords) if (!element.isConnected) commentRecords.delete(element);
+    for (const [element, record] of commentRecords) if (!element.isConnected) { record.badge?.remove(); commentRecords.delete(element); }
     renderStatus();
   }
 
@@ -474,6 +527,8 @@
     }
     record = { text, probability: undefined, epoch: generation, elements: new Set(), item: { type: 'danmaku', text, time, live } };
     danmakuRecords.set(text, record);
+    const emote = blockedEmote(text);
+    if (emote) { record.reason = `表情规则：${emote}`; record.probability = null; return record; }
     if (!text || text === '[图片]' || text.length > 12000) { record.probability = null; return record; }
     engine.evaluate(record.item).then(probability => {
       if (record.epoch !== generation) return;
@@ -609,6 +664,7 @@
         <input id="file" type="file" accept=".txt,.json" hidden>
         <label><input id="comments" type="checkbox"> 过滤评论及楼中楼</label>
         <label><input id="danmaku" type="checkbox"> 过滤弹幕（保留原生显示与设置）</label>
+        <label><input id="debug" type="checkbox"> Debug：在昵称右侧显示 Jev 屏蔽概率</label>
         <label>隐藏阈值 <input id="threshold" type="range" min="0.05" max="0.95" step="0.05"><output id="threshold-value"></output><small>越低越严格。默认 0.30；未完成判断的内容先隐藏。</small></label>
         <details><summary>屏蔽标准</summary><textarea id="policy"></textarea><button id="default-policy">恢复默认标准</button></details>
         <p><button id="save" class="primary">保存并应用</button></p>
@@ -621,6 +677,7 @@
     const note = text => { $('#note').textContent = text; };
     function fill() {
       $('#key').value = settings.apiKey; $('#comments').checked = settings.comments; $('#danmaku').checked = settings.danmaku;
+      $('#debug').checked = settings.debug;
       $('#threshold').value = settings.threshold; $('#threshold-value').value = settings.threshold.toFixed(2); $('#policy').value = settings.policy;
       $('#toggle').textContent = settings.enabled ? '暂停过滤' : '恢复过滤';
     }
@@ -628,6 +685,10 @@
     $('#badge').onclick = open;
     GM_registerMenuCommand('Rage Bait Hider 设置', () => { $('#box').hidden = false; });
     $('#threshold').oninput = () => { $('#threshold-value').value = Number($('#threshold').value).toFixed(2); };
+    $('#debug').onchange = () => {
+      settings.debug = $('#debug').checked; GM_setValue('rbh.settings.v1', settings);
+      for (const record of commentRecords.values()) applyComment(record);
+    };
     $('#import').onclick = () => $('#file').click();
     $('#file').onchange = async () => {
       const file = $('#file').files[0]; if (!file) return;
@@ -666,7 +727,7 @@
     $('#clear').onclick = () => { clearTimeout(saveTimer); scoreCache.clear(); GM_setValue('rbh.scores.v1', []); restart(); note('判断缓存已清空。'); };
     $('#history-button').onclick = () => {
       const hidden = [...commentRecords.values(), ...danmakuRecords.values()].filter(r => r.probability !== undefined && shouldHide(r.probability, settings.threshold));
-      $('#history').textContent = hidden.slice(0, 100).map(r => `${r.probability === null ? '判断失败' : r.probability.toFixed(2)} · ${r.text}`).join('\n') || '当前没有已记录的隐藏内容。';
+      $('#history').textContent = hidden.slice(0, 100).map(r => `${r.reason || (r.probability === null ? '判断失败' : r.probability.toFixed(2))} · ${r.text}`).join('\n') || '当前没有已记录的隐藏内容。';
     };
     fill(); if (!settings.apiKey && pageActive()) $('#box').hidden = false;
     renderStatus();
@@ -675,6 +736,7 @@
   function restart() {
     route = pageKey();
     resetJobs(); dmLoading = false; videoMeta = null;
+    for (const record of commentRecords.values()) record.badge?.remove();
     commentRecords.clear(); danmakuRecords.clear(); nativeBindings.clear();
     for (const observer of nativeObservers.values()) observer.disconnect();
     nativeObservers.clear();
@@ -682,7 +744,10 @@
       element.removeAttribute('data-rbh-dm'); element.removeAttribute('data-rbh-dm-branch');
     }
     revealed = false; if (panelRoot) { panelRoot.querySelector('#reveal').checked = false; panelRoot.querySelector('#history').textContent = ''; }
-    for (const [root] of roots) for (const element of root.querySelectorAll('[data-rbh-state]')) element.removeAttribute('data-rbh-state');
+    for (const [root] of roots) {
+      for (const element of root.querySelectorAll('[data-rbh-state]')) element.removeAttribute('data-rbh-state');
+      for (const element of root.querySelectorAll('[data-rbh-thread]')) element.removeAttribute('data-rbh-thread');
+    }
     title = currentTitle(); dmStatus = settings.danmaku ? '等待加载弹幕' : '弹幕过滤已关闭';
     nativeStatus = settings.danmaku ? '等待原生弹幕容器' : '弹幕过滤已关闭';
     refreshStyles(); scanComments(); scanNativeDanmaku(); void loadDanmaku(); renderStatus();
