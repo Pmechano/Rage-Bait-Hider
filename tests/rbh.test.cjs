@@ -47,6 +47,15 @@ test('protobuf decoder preserves Chinese text and timing; rejects truncated data
   assert.throws(() => core.decodeDanmaku(Uint8Array.from([0])));
 });
 
+test('view metadata defines segment count, including closed/empty/invalid responses', () => {
+  // DmWebViewReply.dmSge (field 4), DmSegConfig.total (field 2).
+  assert.deepEqual(core.decodeDanmakuView(Uint8Array.from([34, 2, 16, 3])), { total: 3, closed: false });
+  assert.deepEqual(core.decodeDanmakuView(Uint8Array.from([34, 2, 16, 0])), { total: 0, closed: false });
+  assert.deepEqual(core.decodeDanmakuView(Uint8Array.from([8, 1])), { total: 0, closed: true });
+  assert.throws(() => core.decodeDanmakuView(Uint8Array.from([])));
+  assert.throws(() => core.decodeDanmakuView(Uint8Array.from([34, 8, 16])));
+});
+
 test('imports plain, assignment and JSON keys without embedding secrets', () => {
   assert.equal(core.parseKey(' \uFEFFfixture-key '), 'fixture-key');
   assert.equal(core.parseKey('TYPESAFE_API_KEY="fixture-key"'), 'fixture-key');
@@ -67,7 +76,13 @@ after(async () => { await browser?.close(); });
 const fixture = `<!doctype html><html><head><meta charset="utf-8"><title>测试视频</title><style>
 body{font-family:sans-serif;margin:30px}.bpx-player-video-area{position:relative;width:800px;height:450px;background:#15202c}video{width:100%;height:100%}.reply-item{padding:12px;border-bottom:1px solid #ccc}
 </style></head><body><h1 class="video-title">测试视频</h1>
-<div class="bpx-player-video-area"><div class="bpx-player-video-wrap"><video></video></div><div class="bpx-player-dm-wrap">原始恶意弹幕</div></div>
+<div class="bpx-player-video-area"><div class="bpx-player-video-wrap"><video></video></div>
+ <div class="bpx-player-dm-wrap"><div class="bpx-player-row-dm-wrap">
+  <div class="native-wrapper"><div id="native-good" class="bili-danmaku-x-dm" style="font-size:28px;transform:translateX(123px);opacity:0.7">这段讲得真好</div>
+  <div id="native-bad" class="b-danmaku">恶意弹幕</div></div>
+  <div id="native-unknown">尚未适配的文字</div>
+ </div></div><div class="bpx-player-bas-dm-wrap" id="native-special">特殊弹幕</div>
+</div>
 <div id="commentapp"><div class="reply-item" id="good"><div class="reply-content">谢谢分享</div></div><div class="reply-item" id="bad"><div class="reply-content">恶意评论，就这？</div></div></div>
 <bili-comments id="modern"></bili-comments>
 <script>
@@ -81,6 +96,7 @@ window.addModern = function(text, isReply = false) {
 };
 window.modernGood=addModern('这是正常的一级评论');window.modernBad=addModern('恶意回复',true);
 Object.defineProperty(document.querySelector('video'),'currentTime',{configurable:true,get(){return window.fakeTime||0;}});
+window.effectiveOpacity=function(el){let opacity=1;for(let node=el;node;node=node.parentElement){const style=getComputedStyle(node);if(style.visibility==='hidden'||style.display==='none')return 0;opacity*=Number(style.opacity);}return opacity;};
 </script></body></html>`;
 
 async function setup(options = {}) {
@@ -116,6 +132,8 @@ async function setup(options = {}) {
             answers[id] = { type: 'noul', noul: /恶意|就这/.test(item.target_text) ? 0.97 : 0.01 };
           });
           config.onload({ status: window.__apiStatus, responseText: JSON.stringify({ answers, usage: { input_tokens: 100 } }) });
+        } else if (config.url.includes('/dm/web/view')) {
+          config.onload({ status: options.viewStatus || 200, response: new Uint8Array([34, 2, 16, options.segments || 1]).buffer });
         } else config.onload({ status: 200, response: new Uint8Array(encoded).buffer });
       }, isJev ? window.__apiDelay : 30);
       return { abort() { clearTimeout(timer); config.onabort?.(); } };
@@ -186,19 +204,122 @@ test('browser: no key means no API traffic and a visible setup prompt', { skip: 
   } finally { await page.close(); }
 });
 
-test('browser: native danmaku hidden; only approved text reaches the replacement overlay', { skip: !browserEnabled }, async () => {
+test('browser: native DOM is preserved; pending/blocked/unknown items are masked', { skip: !browserEnabled }, async () => {
   const { page, errors } = await setup({ danmaku: true });
   try {
-    await page.waitForFunction(() => window.__ui?.querySelector('#counts').textContent.includes('已判断 2'));
-    assert.equal(await page.locator('.bpx-player-dm-wrap').isVisible(), false);
-    await page.evaluate(() => { window.fakeTime = 9.9; });
-    await page.waitForTimeout(100);
-    await page.evaluate(() => { window.fakeTime = 10.1; });
-    await page.waitForFunction(() => document.querySelector('[data-rbh-overlay]')?.textContent.includes('这段讲得真好'));
-    assert.equal(await page.locator('[data-rbh-overlay]').textContent(), '这段讲得真好');
-    await page.evaluate(() => { window.fakeTime = 20; });
-    await page.waitForFunction(() => !document.querySelector('[data-rbh-overlay]').textContent);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0);
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'allowed');
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0.7);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-bad'))), 0);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-unknown'))), 0);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-special'))), 0);
+    assert.equal(await page.locator('[data-rbh-overlay]').count(), 0);
+    const style = await page.locator('#native-good').getAttribute('style');
+    assert.match(style, /translateX\(123px\)/);
+    assert.match(style, /font-size:28px/);
+    // Native display/switch/opacity settings must continue to win after approval.
+    await page.evaluate(() => { document.querySelector('.bpx-player-row-dm-wrap').style.display = 'none'; });
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0);
+    await page.evaluate(() => { document.querySelector('.bpx-player-row-dm-wrap').style.display = ''; });
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0.7);
     assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: reused native nodes are masked before paint; stale answers cannot approve new text', { skip: !browserEnabled }, async () => {
+  const { page } = await setup({ danmaku: true });
+  try {
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'allowed');
+    const opacity = await page.evaluate(async () => {
+      const element = document.querySelector('#native-good');
+      element.firstChild.data = '恶意复用弹幕';
+      await new Promise(requestAnimationFrame);
+      return effectiveOpacity(element);
+    });
+    assert.equal(opacity, 0);
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'hidden');
+    // Put a new safe text in flight, then replace it with a bad text before the response.
+    await page.evaluate(() => { window.__apiDelay = 700; document.querySelector('#native-good').textContent = '新的正常弹幕'; });
+    await page.waitForFunction(() => window.__requests.some(r => Object.values(r.body?.state.items || {}).some(item => item.target_text === '新的正常弹幕')));
+    await page.evaluate(() => { document.querySelector('#native-good').textContent = '恶意异步替换'; });
+    await page.waitForTimeout(1000);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0);
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'hidden');
+  } finally { await page.close(); }
+});
+
+test('browser: a prefetched text is reused without another Jev call; API segment count is authoritative', { skip: !browserEnabled }, async () => {
+  const { page } = await setup({ danmaku: true, segments: 2 });
+  try {
+    await page.waitForFunction(() => window.__ui.querySelector('#counts').textContent.includes('弹幕预取 2/2 段'));
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'allowed');
+    const calls = await page.evaluate(() => window.__requests.filter(r => r.body).length);
+    await page.evaluate(() => {
+      const item = document.createElement('div'); item.id = 'native-late'; item.className = 'bili-dm'; item.textContent = '这段讲得真好';
+      document.querySelector('.bpx-player-row-dm-wrap').append(item);
+    });
+    await page.waitForFunction(() => document.querySelector('#native-late').dataset.rbhDm === 'allowed');
+    assert.equal(await page.evaluate(() => window.__requests.filter(r => r.body).length), calls);
+    assert.equal(await page.evaluate(() => window.__requests.filter(r => r.url.includes('segment_index=2')).length), 1);
+  } finally { await page.close(); }
+});
+
+test('browser: Canvas and unrecognised branches fail closed; direct text invalidates a safe wrapper', { skip: !browserEnabled }, async () => {
+  const { page } = await setup({ danmaku: true });
+  try {
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'allowed');
+    await page.evaluate(() => {
+      const canvas = document.createElement('canvas'); canvas.id = 'native-canvas';
+      document.querySelector('.bpx-player-row-dm-wrap').append(canvas);
+    });
+    await page.waitForFunction(() => window.__ui.querySelector('#counts').textContent.includes('Canvas'));
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-canvas'))), 0);
+    const opacity = await page.evaluate(async () => {
+      document.querySelector('.native-wrapper').append(document.createTextNode('未知的直接文本'));
+      await new Promise(requestAnimationFrame);
+      return effectiveOpacity(document.querySelector('.native-wrapper'));
+    });
+    assert.equal(opacity, 0);
+    await page.evaluate(() => window.__ui.querySelector('#toggle').click());
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-canvas'))), 1);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-bad'))), 1);
+  } finally { await page.close(); }
+});
+
+test('browser: prefetch failure still permits live DOM classification, while model failure does not', { skip: !browserEnabled }, async () => {
+  const { page } = await setup({ danmaku: true, viewStatus: 412 });
+  try {
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'allowed');
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0.7);
+    assert.match(await page.evaluate(() => window.__ui.querySelector('#counts').textContent), /412.*出现时判断/);
+    await page.evaluate(() => {
+      window.__apiStatus = 401;
+      document.querySelector('#native-good').textContent = '还未评估的新弹幕';
+    });
+    await page.waitForFunction(() => window.__ui.querySelector('#status').textContent.includes('鉴权失败'));
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0);
+  } finally { await page.close(); }
+});
+
+test('browser: SPA navigation does not reuse old approval or accept an old response', { skip: !browserEnabled }, async () => {
+  const { page } = await setup({ danmaku: true });
+  try {
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'allowed');
+    await page.evaluate(() => {
+      window.__apiDelay = 800;
+      document.querySelector('#native-good').textContent = '上一视频的正常弹幕';
+    });
+    await page.waitForFunction(() => window.__requests.some(r => Object.values(r.body?.state.items || {}).some(item => item.target_text === '上一视频的正常弹幕')));
+    const opacity = await page.evaluate(async () => {
+      history.pushState({}, '', '/video/BV1xx411c7mD?p=2');
+      document.querySelector('h1').textContent = '下一个分P';
+      document.querySelector('#native-good').textContent = '恶意换页弹幕';
+      await new Promise(requestAnimationFrame);
+      return effectiveOpacity(document.querySelector('#native-good'));
+    });
+    assert.equal(opacity, 0);
+    await page.waitForFunction(() => document.querySelector('#native-good').dataset.rbhDm === 'hidden');
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#native-good'))), 0);
   } finally { await page.close(); }
 });
 

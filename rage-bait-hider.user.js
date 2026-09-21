@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rage Bait Hider · B站评论与弹幕
 // @namespace    local.rage-bait-hider
-// @version      0.1.0
+// @version      0.2.0
 // @description  Jev 单问题过滤：先隐藏，判断通过后显示。支持新旧评论区及普通视频弹幕。
 // @match        https://www.bilibili.com/*
 // @run-at       document-start
@@ -40,10 +40,8 @@
   }
 
   // Minimal, bounds-checked protobuf reader; unknown fields are skipped, never executed.
-  function decodeDanmaku(buffer) {
-    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-    const decoder = new TextDecoder();
-    function fields(data, visitor) {
+  function protobufFields(buffer, visitor) {
+      const data = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
       let offset = 0;
       function varint() {
         let value = 0n;
@@ -71,12 +69,26 @@
         } else throw new Error('不支持的弹幕编码');
         visitor(field, wire, value);
       }
-    }
+  }
+  function decodeDanmakuView(buffer) {
+    let total = null, closed = false;
+    protobufFields(buffer, (field, wire, value) => {
+      if (field === 1 && wire === 0) closed = value !== 0n;
+      if (field === 4 && wire === 2) protobufFields(value, (f, w, v) => {
+        if (f === 2 && w === 0) total = Number(v);
+      });
+    });
+    if (closed) return { total: 0, closed: true };
+    if (!Number.isSafeInteger(total) || total < 0 || total > 10000) throw new Error('弹幕接口未提供有效分段数量');
+    return { total, closed: false };
+  }
+  function decodeDanmaku(buffer) {
+    const decoder = new TextDecoder();
     const result = [];
-    fields(bytes, (field, wire, value) => {
+    protobufFields(buffer, (field, wire, value) => {
       if (field !== 1 || wire !== 2) return;
       const dm = { time: 0, mode: 1, color: 0xffffff, text: '' };
-      fields(value, (f, w, v) => {
+      protobufFields(value, (f, w, v) => {
         if (f === 2 && w === 0) dm.time = Number(v) / 1000;
         if (f === 3 && w === 0) dm.mode = Number(v);
         if (f === 5 && w === 0) dm.color = Number(v);
@@ -100,7 +112,7 @@
   }
 
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { buildRequest, decodeDanmaku, shouldHide, parseKey, POLICY };
+    module.exports = { buildRequest, decodeDanmaku, decodeDanmakuView, shouldHide, parseKey, POLICY };
     return;
   }
 
@@ -109,7 +121,17 @@
   const ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
   const CUSTOM = 'bili-comments,bili-comment-thread-renderer,bili-comment-replies-renderer,bili-comment-renderer,bili-comment-reply-renderer,bili-rich-text';
   const CANDIDATES = 'bili-comment-renderer,bili-comment-reply-renderer,.reply-item,.sub-reply-item,.reply-wrap:not(:has(.reply-item))';
-  const NATIVE_DM = '.bpx-player-dm-wrap,.bpx-player-dm-container,.bpx-player-adv-dm-wrap,.bpx-player-bas-dm-wrap,.bpx-player-cmd-dm-wrap,.bilibili-player-video-danmaku,.bilibili-player-video-adv-danmaku';
+  // Native DOM selectors verified against Bilibili-Evolved (see README references).
+  const DM_CONTAINERS = '.bpx-player-row-dm-wrap,.bpx-player-dm-wrap,.bpx-player-dm-container,.bilibili-player-video-danmaku';
+  const DM_ITEMS = '.b-danmaku,.bili-dm,.bili-danmaku-x-dm';
+  const SPECIAL_DM = '.bpx-player-adv-dm-wrap,.bpx-player-bas-dm-wrap,.bpx-player-cmd-dm-wrap,.bilibili-player-video-adv-danmaku,.bilibili-player-video-bas-danmaku';
+  // Only remove opacity overrides after approval; never force visibility/display/opacity
+  // on an approved item. Native switches, layout and animations remain authoritative.
+  const DANMAKU_CSS = `
+    :is(${DM_CONTAINERS}):not([data-rbh-dm-branch]),
+    [data-rbh-dm-branch] > :not([data-rbh-dm-branch]):not(:is(${DM_ITEMS})[data-rbh-dm="allowed"]),
+    :is(${SPECIAL_DM}) { opacity:0!important; pointer-events:none!important; }
+  `;
   const COMMENT_CSS = `
     bili-comments:not([data-rbh-ready]),bili-comment-thread-renderer:not([data-rbh-ready]),bili-comment-replies-renderer:not([data-rbh-ready]) { visibility:hidden!important; }
     :is(${CANDIDATES}):not([data-rbh-state]),[data-rbh-state="pending"] { visibility:hidden!important; }
@@ -117,15 +139,17 @@
     [data-rbh-state="allowed"],[data-rbh-state="revealed"] { visibility:visible!important; }
   `;
   let generation = 0, route = '', title = '', videoMeta = null;
-  let engine, panel, panelRoot, overlay, video, scanTimer, dmLoading = false;
-  let commentRecords = new Map(), danmakuRecords = [], dmStatus = '等待视频', apiStatus = '';
+  let engine, panel, panelRoot, video, scanTimer, dmLoading = false;
+  let commentRecords = new Map(), dmStatus = '等待视频', apiStatus = '', nativeStatus = '等待原生弹幕容器';
+  const danmakuRecords = new Map(), nativeBindings = new Map(), nativeObservers = new Map();
   let revealed = false, cacheHits = 0, requestCount = 0, inputTokens = 0;
-  const roots = new Map(), jobs = new Map(), queue = [], activeBubbles = new Set();
+  const roots = new Map(), jobs = new Map(), queue = [];
   let activeRequests = 0, nextRequestAt = 0, fatalError = '', flushTimer;
   let scoreCache = new Map(GM_getValue('rbh.scores.v1', []).filter(entry => Array.isArray(entry) && entry[1]?.expires > Date.now()));
   let saveTimer;
   const pendingHandles = new Set();
   const pageActive = () => /^\/video\/(?:BV[\w]+|av\d+)/i.test(location.pathname);
+  const pageKey = () => `${location.pathname}?p=${new URLSearchParams(location.search).get('p') || '1'}`;
   const filtering = () => pageActive() && settings.enabled;
   const currentTitle = () => normalize(document.querySelector('h1.video-title,h1[title],h1')?.getAttribute('title') || document.querySelector('h1.video-title,h1')?.textContent || title || document.title.replace(/[_-]哔哩哔哩.*$/, ''));
 
@@ -187,7 +211,7 @@
     // Comments first; then the nearest upcoming danmaku. Other segments still get processed.
     const now = video?.currentTime || 0;
     queue.sort((a, b) => {
-      const priority = j => j.item.type === 'comment' ? -1e9 : ((j.item.time || 0) < now ? 1e7 : 0) + Math.abs((j.item.time || 0) - now);
+      const priority = j => j.item.type === 'comment' ? -1e9 : j.item.live ? -1e8 : ((j.item.time || 0) < now ? 1e7 : 0) + Math.abs((j.item.time || 0) - now);
       return priority(a) - priority(b);
     });
     const batch = [];
@@ -261,7 +285,7 @@
   function cssForRoot(root) {
     const enabled = filtering();
     let css = enabled && settings.comments && !revealed ? COMMENT_CSS : '';
-    if (root === document && enabled && settings.danmaku) css += `${NATIVE_DM} { visibility:hidden!important; opacity:0!important; pointer-events:none!important; }`;
+    if (root === document && enabled && settings.danmaku) css += DANMAKU_CSS;
     return css;
   }
   function watchRoot(root) {
@@ -270,10 +294,11 @@
     style.textContent = cssForRoot(root);
     (root === document ? document.documentElement : root)?.append(style);
     const observer = new MutationObserver(mutations => {
+      if (root === document) invalidateNativeMutations(mutations);
       let changed = false;
       for (const mutation of mutations) {
         const element = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
-        if (element?.closest?.('[data-rbh-ui],[data-rbh-overlay],[data-rbh-style]')) continue;
+        if (element?.closest?.('[data-rbh-ui],[data-rbh-style]')) continue;
         changed = true;
         // Recycled nodes must lose their previous approval BEFORE the browser paints.
         const candidate = composedParent(element, CANDIDATES);
@@ -292,7 +317,7 @@
   }
   function scheduleScan() {
     if (scanTimer) return;
-    scanTimer = setTimeout(() => { scanTimer = null; scanComments(); }, 70);
+    scanTimer = setTimeout(() => { scanTimer = null; scanComments(); scanNativeDanmaku(); }, 70);
   }
   function richText(node) {
     if (!node) return '';
@@ -341,6 +366,7 @@
   }
   function scanComments() {
     if (!document.documentElement) return;
+    if (route && pageKey() !== route) { restart(); return; }
     watchRoot(document);
     // Iterating a Map also visits newly discovered shadow roots.
     for (const [root, data] of roots) {
@@ -398,25 +424,112 @@
     const page = data.pages?.find(p => Number(p.page) === part);
     if (!page && part !== 1) throw new Error('找不到当前分P的信息');
     const cid = page?.cid || data.cid, duration = page?.duration || data.duration;
-    if (!/^\d+$/.test(String(cid)) || !(duration > 0)) throw new Error('无法识别视频 CID 或时长');
+    if (!/^\d+$/.test(String(cid))) throw new Error('无法识别视频 CID');
     return { cid, duration, title: normalize(data.title), part: normalize(page?.part), aid: data.aid };
   }
-  function attachOverlay() {
-    const nextVideo = document.querySelector('.bpx-player-video-wrap video,.bilibili-player-video video,video');
-    if (!nextVideo) return;
-    const host = nextVideo.closest('.bpx-player-video-area,.bilibili-player-video-wrap') || nextVideo.parentElement;
-    if (video === nextVideo && overlay?.isConnected && overlay.parentElement === host) return;
-    overlay?.remove(); clearBubbles(); video = nextVideo;
-    overlay = document.createElement('div'); overlay.dataset.rbhOverlay = 'true';
-    overlay.style.cssText = 'position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:12;contain:layout style paint;';
-    // The B站 player uses a positioned video area. Only patch a static fallback parent.
-    if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
-    host.append(overlay);
+
+  function hasDirectText(element) {
+    return [...element.childNodes].some(node => node.nodeType === 3 && normalize(node.textContent));
   }
-  function clearBubbles() {
-    for (const bubble of activeBubbles) bubble.element.remove();
-    activeBubbles.clear();
+  function nativeText(element) {
+    // Pixel-only/emote-only elements cannot be classified as text.
+    return normalize(richText(element));
   }
+  function invalidateNativeMutations(mutations) {
+    if (!filtering() || !settings.danmaku) return;
+    if (route && pageKey() !== route) { restart(); return; }
+    for (const mutation of mutations) {
+      const target = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
+      if (!target?.closest?.(DM_CONTAINERS)) continue;
+      const item = target.closest(DM_ITEMS);
+      if (item) item.removeAttribute('data-rbh-dm');
+      // A wrapper containing raw text is no longer a safe path to approved items.
+      if (target.hasAttribute?.('data-rbh-dm-branch') && hasDirectText(target)) target.removeAttribute('data-rbh-dm-branch');
+      for (const node of mutation.addedNodes || []) {
+        if (node.nodeType !== 1) continue;
+        node.removeAttribute('data-rbh-dm');
+        node.removeAttribute('data-rbh-dm-branch');
+        for (const child of node.querySelectorAll('[data-rbh-dm],[data-rbh-dm-branch]')) {
+          child.removeAttribute('data-rbh-dm'); child.removeAttribute('data-rbh-dm-branch');
+        }
+      }
+    }
+  }
+  function applyNativeItem(element, record) {
+    if (!element.isConnected || record.epoch !== generation || nativeBindings.get(element) !== record) return;
+    if (pageKey() !== route || currentTitle() !== title) { element.removeAttribute('data-rbh-dm'); return; }
+    // Async responses must never approve an element that the player has recycled.
+    if (!element.matches(DM_ITEMS) || nativeText(element) !== record.text) {
+      element.removeAttribute('data-rbh-dm'); return;
+    }
+    element.dataset.rbhDm = shouldHide(record.probability, settings.threshold) ? 'hidden' : 'allowed';
+  }
+  function scoreDanmaku(text, time = 0, live = false) {
+    let record = danmakuRecords.get(text);
+    if (record) {
+      if (live) record.item.live = true;
+      return record;
+    }
+    record = { text, probability: undefined, epoch: generation, elements: new Set(), item: { type: 'danmaku', text, time, live } };
+    danmakuRecords.set(text, record);
+    if (!text || text === '[图片]' || text.length > 12000) { record.probability = null; return record; }
+    engine.evaluate(record.item).then(probability => {
+      if (record.epoch !== generation) return;
+      record.probability = probability;
+      for (const element of record.elements) applyNativeItem(element, record);
+    });
+    return record;
+  }
+  function scanNativeDanmaku() {
+    video = document.querySelector('.bpx-player-video-wrap video,.bilibili-player-video video,.bpx-player-video-area bwp-video');
+    for (const [element, record] of nativeBindings) {
+      if (!element.isConnected || !element.matches(DM_ITEMS) || !element.closest(DM_CONTAINERS)) {
+        record.elements.delete(element); nativeBindings.delete(element); element.removeAttribute('data-rbh-dm');
+      }
+    }
+    for (const [container, observer] of nativeObservers) {
+      if (!container.isConnected) { observer.disconnect(); nativeObservers.delete(container); }
+    }
+    if (!filtering() || !settings.danmaku) return;
+    const containers = [...document.querySelectorAll(DM_CONTAINERS)];
+    for (const branch of document.querySelectorAll('[data-rbh-dm-branch]')) {
+      if (hasDirectText(branch) || branch.matches(DM_ITEMS) || !branch.closest(DM_CONTAINERS)) branch.removeAttribute('data-rbh-dm-branch');
+    }
+    let foundItems = 0, hasCanvas = false;
+    for (const container of containers) {
+      if (container.closest(SPECIAL_DM)) continue;
+      if (!nativeObservers.has(container)) {
+        const observer = new MutationObserver(mutations => { invalidateNativeMutations(mutations); scheduleScan(); });
+        // Native animations update style constantly: observe content and class, not style.
+        observer.observe(container, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class'] });
+        nativeObservers.set(container, observer);
+      }
+      hasCanvas ||= !!container.querySelector('canvas');
+      for (const element of container.querySelectorAll(DM_ITEMS)) {
+        if (element.closest(SPECIAL_DM) || element.parentElement?.closest(DM_ITEMS)) continue;
+        const text = nativeText(element);
+        if (!text) { element.removeAttribute('data-rbh-dm'); continue; }
+        foundItems++;
+        // Allow only structural ancestors; every unrecognised sibling remains masked.
+        for (let branch = element.parentElement; branch?.closest(DM_CONTAINERS); branch = branch.parentElement) {
+          if (!hasDirectText(branch)) branch.dataset.rbhDmBranch = 'true';
+        }
+        let record = nativeBindings.get(element);
+        if (!record || record.text !== text || record.epoch !== generation) {
+          element.removeAttribute('data-rbh-dm');
+          record?.elements.delete(element);
+          record = scoreDanmaku(text, Number(video?.currentTime) || 0, true);
+          nativeBindings.set(element, record); record.elements.add(element);
+        }
+        applyNativeItem(element, record);
+      }
+    }
+    nativeStatus = hasCanvas
+      ? '检测到 Canvas 弹幕：该层保持隐藏，支持的 DOM 弹幕仍可过滤'
+      : foundItems ? '已接入原生 DOM 弹幕 · 未识别元素保持隐藏'
+        : containers.length ? '等待原生文字弹幕 · 未识别内容保持隐藏' : '未识别原生弹幕容器，请检查播放器兼容性';
+  }
+
   async function loadDanmaku() {
     if (dmLoading || !filtering() || !settings.danmaku || !settings.apiKey) return;
     dmLoading = true;
@@ -427,12 +540,19 @@
       videoMeta = meta;
       // Keep the same title for the whole generation so comments and cache agree.
       if (!title) title = meta.title;
-      const total = Math.ceil(meta.duration / 360), remaining = new Set(Array.from({ length: total }, (_, i) => i + 1));
+      const viewResponse = await request({ method: 'GET', responseType: 'arraybuffer',
+        url: `https://api.bilibili.com/x/v2/dm/web/view?type=1&oid=${meta.cid}&pid=${meta.aid || ''}` });
+      if (epoch !== generation) return;
+      if (viewResponse.status !== 200) throw new Error(`弹幕信息接口 HTTP ${viewResponse.status}`);
+      const { total, closed } = decodeDanmakuView(viewResponse.response);
+      if (closed) { dmStatus = 'B站接口显示弹幕已关闭'; return; }
+      const remaining = new Set(Array.from({ length: total }, (_, i) => i + 1));
       let loaded = 0, unsupported = 0;
+      dmStatus = `弹幕预取 ${loaded}/${total} 段`;
       while (remaining.size && epoch === generation && filtering() && settings.danmaku) {
         const wanted = Math.floor((video?.currentTime || 0) / 360) + 1;
         const segment = remaining.has(wanted) ? wanted : remaining.values().next().value;
-        dmStatus = `弹幕加载 ${loaded}/${total} 段`;
+        dmStatus = `弹幕预取 ${loaded}/${total} 段`;
         const response = await request({ method: 'GET', responseType: 'arraybuffer',
           url: `https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=${meta.cid}&pid=${meta.aid || ''}&segment_index=${segment}` });
         if (epoch !== generation) return;
@@ -440,72 +560,16 @@
         const entries = decodeDanmaku(response.response);
         for (const item of entries) {
           if (![1, 2, 3, 4, 5, 6].includes(item.mode)) { unsupported++; continue; }
-          const record = { ...item, probability: undefined };
-          danmakuRecords.push(record);
-          engine.evaluate({ type: 'danmaku', text: item.text, time: item.time }).then(probability => {
-            if (epoch !== generation) return;
-            record.probability = probability;
-          });
+          scoreDanmaku(item.text, item.time);
         }
-        danmakuRecords.sort((a, b) => a.time - b.time);
         remaining.delete(segment); loaded++;
-        dmStatus = `弹幕加载 ${loaded}/${total} 段 · ${danmakuRecords.length} 条${unsupported ? ` · 跳过 ${unsupported} 条特殊弹幕` : ''}`;
+        dmStatus = `弹幕预取 ${loaded}/${total} 段${unsupported ? ` · 跳过 ${unsupported} 条特殊弹幕` : ''}`;
         renderStatus();
         if (remaining.size) await sleep(800);
       }
     } catch (error) {
-      if (epoch === generation) dmStatus = `${error.message}；原生弹幕保持隐藏，可点击重试`;
+      if (epoch === generation) dmStatus = `${error.message}；已转为原生文字出现时判断，可点击重试预取`;
     } finally { if (epoch === generation) dmLoading = false; renderStatus(); }
-  }
-
-  let lastVideoTime = -1, dmCursor = 0;
-  function lowerBound(time) {
-    let lo = 0, hi = danmakuRecords.length;
-    while (lo < hi) { const mid = (lo + hi) >>> 1; if (danmakuRecords[mid].time < time) lo = mid + 1; else hi = mid; }
-    return lo;
-  }
-  function drawDanmaku() {
-    requestAnimationFrame(drawDanmaku);
-    if (!filtering() || !settings.danmaku || !video || !overlay?.isConnected) { clearBubbles(); return; }
-    const time = video.currentTime;
-    if (lastVideoTime < 0 || time < lastVideoTime || Math.abs(time - lastVideoTime) > 1.5) {
-      clearBubbles(); dmCursor = lowerBound(Math.max(0, time - 0.15));
-    }
-    // Segments can arrive out of order, so find the current small interval each frame.
-    if (time !== lastVideoTime) {
-      const start = Math.max(0, Math.min(lastVideoTime < 0 ? time - 0.15 : lastVideoTime, time));
-      dmCursor = lowerBound(start);
-      while (dmCursor < danmakuRecords.length && danmakuRecords[dmCursor].time <= time) {
-        const dm = danmakuRecords[dmCursor++];
-        if (dm.time > start || lastVideoTime < 0 || dm.time === 0 && lastVideoTime <= 0) {
-          if (!shouldHide(dm.probability, settings.threshold) && time - dm.time < 1) spawnBubble(dm, time);
-        }
-      }
-    }
-    lastVideoTime = time;
-    const width = overlay.clientWidth;
-    for (const bubble of activeBubbles) {
-      const elapsed = time - bubble.start;
-      if (elapsed >= bubble.life || elapsed < 0) { bubble.element.remove(); activeBubbles.delete(bubble); continue; }
-      if (!bubble.fixed) {
-        const fraction = elapsed / bubble.life;
-        const x = bubble.reverse ? -bubble.width + (width + bubble.width) * fraction : width - (width + bubble.width) * fraction;
-        bubble.element.style.transform = `translateX(${x}px)`;
-      }
-    }
-  }
-  function spawnBubble(dm, now) {
-    if (!overlay.clientWidth || activeBubbles.size >= 36) return;
-    const fixed = dm.mode === 4 || dm.mode === 5;
-    const lanes = Math.max(1, Math.min(12, Math.floor(overlay.clientHeight * 0.65 / 30)));
-    const occupied = new Set([...activeBubbles].filter(b => b.fixed || now - b.start < 2).map(b => b.lane));
-    let lane = Array.from({ length: lanes }, (_, i) => i).find(i => !occupied.has(i));
-    if (lane === undefined) return;
-    if (dm.mode === 4) lane = lanes - 1;
-    const element = document.createElement('span'); element.textContent = dm.text;
-    element.style.cssText = `position:absolute;left:${fixed ? '50%' : '0'};top:${lane * 30 + 8}px;white-space:nowrap;font:bold 22px/30px sans-serif;color:#${(dm.color & 0xffffff).toString(16).padStart(6, '0')};text-shadow:1px 1px 2px #000,-1px -1px 2px #000;${fixed ? 'transform:translateX(-50%);' : ''}`;
-    overlay.append(element);
-    activeBubbles.add({ element, start: now, life: fixed ? 4 : 8, width: element.offsetWidth, lane, fixed, reverse: dm.mode === 6 });
   }
 
   function renderStatus() {
@@ -513,11 +577,12 @@
     const records = [...commentRecords.values()];
     const blocked = records.filter(r => r.probability !== undefined && shouldHide(r.probability, settings.threshold)).length;
     const waiting = records.filter(r => r.probability === undefined).length;
-    const dmDone = danmakuRecords.filter(r => r.probability !== undefined).length;
-    const dmBlocked = danmakuRecords.filter(r => r.probability !== undefined && shouldHide(r.probability, settings.threshold)).length;
+    const dmRecords = [...danmakuRecords.values()];
+    const dmDone = dmRecords.filter(r => r.probability !== undefined).length;
+    const dmBlocked = dmRecords.filter(r => r.probability !== undefined && shouldHide(r.probability, settings.threshold)).length;
     const status = !settings.enabled ? '已暂停 · 原始内容可见' : !settings.apiKey ? '请先导入 API Key · 内容保持隐藏' : fatalError || apiStatus || '过滤已开启';
     panelRoot.querySelector('#status').textContent = status;
-    panelRoot.querySelector('#counts').textContent = `评论 ${records.length} 条：隐藏 ${blocked}，待判断 ${waiting}\n弹幕 ${danmakuRecords.length} 条：已判断 ${dmDone}，隐藏 ${dmBlocked}\n${dmStatus}\n请求 ${requestCount} 次 · 缓存命中 ${cacheHits} · 输入 ${inputTokens} tokens`;
+    panelRoot.querySelector('#counts').textContent = `评论 ${records.length} 条：隐藏 ${blocked}，待判断 ${waiting}\n弹幕文本 ${dmRecords.length} 条：已判断 ${dmDone}，隐藏 ${dmBlocked}\n${nativeStatus}\n${dmStatus}\n请求 ${requestCount} 次 · 缓存命中 ${cacheHits} · 输入 ${inputTokens} tokens`;
     panelRoot.querySelector('#badge').textContent = `净 ${blocked + dmBlocked}${waiting || queue.length ? ' · …' : ''}`;
   }
   function createPanel() {
@@ -541,7 +606,7 @@
         <div class="row"><button id="import">导入 Key 文件</button><button id="test">测试连接</button></div>
         <input id="file" type="file" accept=".txt,.json" hidden>
         <label><input id="comments" type="checkbox"> 过滤评论及楼中楼</label>
-        <label><input id="danmaku" type="checkbox"> 过滤弹幕（使用筛选后的普通弹幕层）</label>
+        <label><input id="danmaku" type="checkbox"> 过滤弹幕（保留原生显示与设置）</label>
         <label>隐藏阈值 <input id="threshold" type="range" min="0.05" max="0.95" step="0.05"><output id="threshold-value"></output><small>越低越严格。默认 0.30；未完成判断的内容先隐藏。</small></label>
         <details><summary>屏蔽标准</summary><textarea id="policy"></textarea><button id="default-policy">恢复默认标准</button></details>
         <p><button id="save" class="primary">保存并应用</button></p>
@@ -598,7 +663,7 @@
     $('#reveal').onchange = () => { revealed = $('#reveal').checked; refreshStyles(); for (const record of commentRecords.values()) applyComment(record); };
     $('#clear').onclick = () => { clearTimeout(saveTimer); scoreCache.clear(); GM_setValue('rbh.scores.v1', []); restart(); note('判断缓存已清空。'); };
     $('#history-button').onclick = () => {
-      const hidden = [...commentRecords.values(), ...danmakuRecords].filter(r => r.probability !== undefined && shouldHide(r.probability, settings.threshold));
+      const hidden = [...commentRecords.values(), ...danmakuRecords.values()].filter(r => r.probability !== undefined && shouldHide(r.probability, settings.threshold));
       $('#history').textContent = hidden.slice(0, 100).map(r => `${r.probability === null ? '判断失败' : r.probability.toFixed(2)} · ${r.text}`).join('\n') || '当前没有已记录的隐藏内容。';
     };
     fill(); if (!settings.apiKey && pageActive()) $('#box').hidden = false;
@@ -606,29 +671,35 @@
   }
 
   function restart() {
+    route = pageKey();
     resetJobs(); dmLoading = false; videoMeta = null;
-    commentRecords.clear(); danmakuRecords = []; clearBubbles(); lastVideoTime = -1;
+    commentRecords.clear(); danmakuRecords.clear(); nativeBindings.clear();
+    for (const observer of nativeObservers.values()) observer.disconnect();
+    nativeObservers.clear();
+    for (const element of document.querySelectorAll('[data-rbh-dm],[data-rbh-dm-branch]')) {
+      element.removeAttribute('data-rbh-dm'); element.removeAttribute('data-rbh-dm-branch');
+    }
     revealed = false; if (panelRoot) { panelRoot.querySelector('#reveal').checked = false; panelRoot.querySelector('#history').textContent = ''; }
     for (const [root] of roots) for (const element of root.querySelectorAll('[data-rbh-state]')) element.removeAttribute('data-rbh-state');
     title = currentTitle(); dmStatus = settings.danmaku ? '等待加载弹幕' : '弹幕过滤已关闭';
-    refreshStyles(); scanComments(); attachOverlay(); void loadDanmaku(); renderStatus();
+    nativeStatus = settings.danmaku ? '等待原生弹幕容器' : '弹幕过滤已关闭';
+    refreshStyles(); scanComments(); scanNativeDanmaku(); void loadDanmaku(); renderStatus();
   }
   function boot() {
     if (!document.documentElement) { setTimeout(boot, 0); return; }
-    watchRoot(document); title = currentTitle(); route = `${location.pathname}${new URLSearchParams(location.search).get('p') || '1'}`;
+    watchRoot(document); title = currentTitle(); route = pageKey();
     scanComments();
     setInterval(() => {
-      const nextRoute = `${location.pathname}${new URLSearchParams(location.search).get('p') || '1'}`;
+      const nextRoute = pageKey();
       createPanel();
       if (nextRoute !== route) { route = nextRoute; restart(); }
       else if (pageActive() && currentTitle() !== title) restart();
-      if (pageActive()) { attachOverlay(); scanComments(); if (!videoMeta && !dmLoading && dmStatus === '等待视频') void loadDanmaku(); }
+      if (pageActive()) { scanNativeDanmaku(); scanComments(); if (!videoMeta && !dmLoading && dmStatus === '等待视频') void loadDanmaku(); }
       if (panel) panel.style.display = pageActive() ? '' : 'none';
       renderStatus();
     }, 1000);
-    requestAnimationFrame(drawDanmaku);
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => { createPanel(); attachOverlay(); void loadDanmaku(); }, { once: true });
-    else { createPanel(); attachOverlay(); void loadDanmaku(); }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => { createPanel(); scanNativeDanmaku(); void loadDanmaku(); }, { once: true });
+    else { createPanel(); scanNativeDanmaku(); void loadDanmaku(); }
   }
   boot();
 })();
