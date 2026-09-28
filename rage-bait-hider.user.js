@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rage Bait Hider · B站评论与弹幕
 // @namespace    local.rage-bait-hider
-// @version      0.3.2
+// @version      0.3.3
 // @updateURL    https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @downloadURL  https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @description  Jev 单问题过滤：先隐藏，判断通过后显示。支持新旧评论区及普通视频弹幕。
@@ -19,6 +19,8 @@
 
 (() => {
   'use strict';
+
+  const VERSION = '0.3.3';
 
   const POLICY = '包含以下任意一种就属于应屏蔽内容：引战挑衅、煽动群体对立、阴阳怪气、贬损性嘲讽、人身攻击、拉踩炫耀优越感、空洞叫嚣、无意义灌水或刷烂梗。正常讨论、真诚提问、信息分享、具体且就事论事的批评、友善玩笑以及与视频有关的普通情绪表达不属于屏蔽内容。';
   const DEFAULTS = { enabled: true, comments: true, danmaku: true, debug: false, threshold: 0.3, policy: POLICY, apiKey: '' };
@@ -139,7 +141,8 @@
     bili-comments:not([data-rbh-ready]),bili-comment-thread-renderer:not([data-rbh-ready]),bili-comment-replies-renderer:not([data-rbh-ready]) { visibility:hidden!important; }
     :is(${CANDIDATES}):not([data-rbh-state]),[data-rbh-state="pending"] { visibility:hidden!important; }
     [data-rbh-state="blocked"],[data-rbh-state="error"] { display:none!important; }
-    [data-rbh-thread]:not([data-rbh-thread="allowed"]):not([data-rbh-thread="revealed"]) { display:none!important; }
+    [data-rbh-thread="blocked"],[data-rbh-thread="error"] { display:none!important; }
+    [data-rbh-thread="pending"] { opacity:0!important; pointer-events:none!important; }
     [data-rbh-state="allowed"],[data-rbh-state="revealed"] { visibility:visible!important; }
   `;
   let generation = 0, route = '', title = '', videoMeta = null;
@@ -156,6 +159,58 @@
   const pageKey = () => `${location.pathname}?p=${new URLSearchParams(location.search).get('p') || '1'}`;
   const filtering = () => pageActive() && settings.enabled;
   const currentTitle = () => normalize(document.querySelector('h1.video-title,h1[title],h1')?.getAttribute('title') || document.querySelector('h1.video-title,h1')?.textContent || title || document.title.replace(/[_-]哔哩哔哩.*$/, ''));
+
+  // Fixed event names, local node numbers and numeric measurements only.
+  // Never record DOM text, URLs, headers, complete settings objects or raw errors.
+  const logStarted = Date.now(), diagnosticEvents = [], diagnosticIds = new WeakMap();
+  const diagnosticTotals = { scans: 0, invalidations: 0, unchangedMutations: 0, transitions: 0, restarts: 0, droppedEvents: 0 };
+  let nextDiagnosticId = 0, lastLayout = '';
+  function diagnosticEvent(type, fields = {}) {
+    diagnosticEvents.push({ ms: Date.now() - logStarted, generation, type, ...fields });
+    if (diagnosticEvents.length > 1500) { diagnosticEvents.shift(); diagnosticTotals.droppedEvents++; }
+  }
+  function diagnosticId(element) {
+    if (!diagnosticIds.has(element)) diagnosticIds.set(element, ++nextDiagnosticId);
+    return diagnosticIds.get(element);
+  }
+  function setThreadState(element, state) {
+    if (element && element.dataset.rbhThread !== state) element.dataset.rbhThread = state;
+  }
+  function setCommentState(element, state) {
+    if (element.dataset.rbhState === state) return;
+    const previous = element.dataset.rbhState;
+    element.dataset.rbhState = state;
+    diagnosticTotals.transitions++;
+    const states = ['pending', 'allowed', 'blocked', 'error', 'revealed'];
+    diagnosticEvent('comment-state', { node: diagnosticId(element), from: states.includes(previous) ? previous : 'unset', to: state });
+  }
+  function sampleLayout() {
+    const scrolling = document.scrollingElement;
+    if (!scrolling || !pageActive()) return;
+    const layout = { y: Math.round(scrolling.scrollTop), height: scrolling.scrollHeight, viewport: innerHeight, width: innerWidth };
+    const signature = JSON.stringify(layout);
+    if (signature !== lastLayout) { lastLayout = signature; diagnosticEvent('layout', layout); }
+  }
+  function exportDiagnostics() {
+    sampleLayout(); diagnosticEvent('export');
+    const states = { pending: 0, allowed: 0, blocked: 0, error: 0, revealed: 0, unset: 0 };
+    for (const record of commentRecords.values()) {
+      const state = record.element.dataset.rbhState;
+      states[Object.hasOwn(states, state) ? state : 'unset']++;
+    }
+    const report = {
+      format: 1, version: VERSION, exportedAt: new Date().toISOString(), sessionMs: Date.now() - logStarted,
+      settings: { enabled: !!settings.enabled, comments: !!settings.comments, danmaku: !!settings.danmaku, debug: !!settings.debug, threshold: settings.threshold },
+      summary: { ...diagnosticTotals, generation, comments: states, roots: roots.size, queued: queue.length,
+        activeRequests, requestCount, cacheHits, cacheEntries: scoreCache.size, danmakuTexts: danmakuRecords.size },
+      events: diagnosticEvents.slice()
+    };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
+    const link = document.createElement('a'); link.dataset.rbhUi = 'true';
+    link.href = url; link.download = `rage-bait-hider-log-${Date.now()}.json`; link.hidden = true;
+    document.body.append(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
 
   function request(options) {
     return new Promise((resolve, reject) => {
@@ -249,8 +304,10 @@
         if (!batch.length) return;
         const body = buildRequest(title, batch.map(job => job.item), settings.policy);
         requestCount++;
+        diagnosticEvent('jev-send', { count: batch.length, attempt: attempt + 1 });
         const response = await request({ method: 'POST', url: ENDPOINT, anonymous: true,
           headers: { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' }, data: JSON.stringify(body) });
+        diagnosticEvent('jev-response', { status: Number(response.status) || 0, count: batch.length });
         if (epoch !== generation) return;
         if (response.status === 401 || response.status === 403) {
           fatalError = `Jev 鉴权失败（${response.status}），请检查 Key。`; throw new Error(fatalError);
@@ -317,15 +374,24 @@
         const element = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
         if (element?.closest?.('[data-rbh-ui],[data-rbh-style],[data-rbh-debug]')) continue;
         const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
-        if (mutation.type === 'childList' && changedNodes.length && changedNodes.every(node => node.matches?.('[data-rbh-debug]'))) continue;
+        if (mutation.type === 'childList' && changedNodes.length && changedNodes.every(node => node.matches?.('[data-rbh-debug],[data-rbh-style],[data-rbh-ui]'))) continue;
         changed = true;
         // Recycled nodes must lose their previous approval BEFORE the browser paints.
         const candidate = composedParent(element, CANDIDATES);
         if (candidate && filtering() && settings.comments && !revealed) {
-          candidate.dataset.rbhState = 'pending';
-          const thread = commentThread(candidate);
-          if (thread) thread.dataset.rbhThread = 'pending';
-          commentRecords.get(candidate)?.badge?.remove();
+          const record = commentRecords.get(candidate);
+          // Votes, avatars, reply controls and identical re-renders do not change
+          // the judged text. Collapsing a thread here causes scroll jumps.
+          if (record && record.epoch === generation && pageKey() === route && currentTitle() === title
+            && textOf(candidate) === record.text && parentText(candidate) === record.parent) {
+            diagnosticTotals.unchangedMutations++;
+            continue;
+          }
+          diagnosticTotals.invalidations++;
+          diagnosticEvent('comment-invalidated', { node: diagnosticId(candidate), mutation: mutation.type });
+          setCommentState(candidate, 'pending');
+          setThreadState(commentThread(candidate), 'pending');
+          record?.badge?.remove();
         }
       }
       if (changed) scheduleScan();
@@ -435,14 +501,14 @@
     else if (record.probability === undefined) state = 'pending';
     else if (record.probability === null) state = 'error';
     else state = shouldHide(record.probability, settings.threshold) ? 'blocked' : 'allowed';
-    if (record.element.dataset.rbhState !== state) record.element.dataset.rbhState = state;
-    const thread = commentThread(record.element);
-    if (thread) thread.dataset.rbhThread = state;
+    setCommentState(record.element, state);
+    setThreadState(commentThread(record.element), state);
     updateCommentDebug(record, state);
   }
   function scanComments() {
+    diagnosticTotals.scans++;
     if (!document.documentElement) return;
-    if (route && pageKey() !== route) { restart(); return; }
+    if (route && pageKey() !== route) { restart('route'); return; }
     watchRoot(document);
     // Iterating a Map also visits newly discovered shadow roots.
     for (const [root, data] of roots) {
@@ -453,8 +519,8 @@
     }
     for (const [root] of roots) {
       for (const host of root.querySelectorAll('bili-comments,bili-comment-thread-renderer,bili-comment-replies-renderer')) {
-        if (host.shadowRoot && roots.has(host.shadowRoot)) host.dataset.rbhReady = 'true';
-        if (host.matches('bili-comment-thread-renderer') && !host.hasAttribute('data-rbh-thread')) host.dataset.rbhThread = 'pending';
+        if (host.shadowRoot && roots.has(host.shadowRoot) && host.dataset.rbhReady !== 'true') host.dataset.rbhReady = 'true';
+        if (host.matches('bili-comment-thread-renderer') && !host.hasAttribute('data-rbh-thread')) setThreadState(host, 'pending');
       }
       if (!filtering() || !settings.comments) continue;
       for (const element of root.querySelectorAll(CANDIDATES)) {
@@ -463,8 +529,8 @@
         const text = textOf(element), parent = parentText(element);
         if (!text) {
           const previous = commentRecords.get(element); previous?.badge?.remove(); commentRecords.delete(element);
-          element.dataset.rbhState = 'pending';
-          const thread = commentThread(element); if (thread) thread.dataset.rbhThread = 'pending';
+          setCommentState(element, 'pending');
+          setThreadState(commentThread(element), 'pending');
           continue; // Unknown/image-only structures remain hidden with their replies.
         }
         const fingerprint = JSON.stringify([title, text, parent]);
@@ -521,7 +587,7 @@
   }
   function invalidateNativeMutations(mutations) {
     if (!filtering() || !settings.danmaku) return;
-    if (route && pageKey() !== route) { restart(); return; }
+    if (route && pageKey() !== route) { restart('route'); return; }
     for (const mutation of mutations) {
       const target = mutation.target.nodeType === 3 ? mutation.target.parentElement : mutation.target;
       if (!target?.closest?.(DM_CONTAINERS)) continue;
@@ -697,7 +763,7 @@
         <label>隐藏阈值 <input id="threshold" type="range" min="0.05" max="0.95" step="0.05"><output id="threshold-value"></output><small>越低越严格。默认 0.30；未完成判断的内容先隐藏。</small></label>
         <details><summary>屏蔽标准</summary><textarea id="policy"></textarea><button id="default-policy">恢复默认标准</button></details>
         <p><button id="save" class="primary">保存并应用</button></p>
-        <details><summary>查看与排查</summary><label><input id="reveal" type="checkbox"> 临时显示本页所有评论（包括未判断的）</label><div class="row"><button id="history-button">查看隐藏内容</button><button id="clear">清空判断缓存</button></div><div id="history"></div></details>
+        <details><summary>查看与排查</summary><label><input id="reveal" type="checkbox"> 临时显示本页所有评论（包括未判断的）</label><div class="row"><button id="history-button">查看隐藏内容</button><button id="clear">清空判断缓存</button><button id="export-log">导出诊断日志</button></div><small>自动记录当前标签页最近的滚动、布局和过滤状态；不含 Key、正文、标题、网址或账号信息，不自动上传。</small><div id="history"></div></details>
         <p id="note" role="status"></p>
         <small>评论/弹幕正文、视频标题及可取得的父评论会发送给 TypeSafe。Key 只保存在油猴存储中。纯图片评论与高级弹幕暂不显示。新加载的评论会继续过滤。</small>
       </section><button id="badge" title="打开过滤设置">净</button>`;
@@ -746,14 +812,15 @@
         const policy = $('#policy').value.trim();
         if (!policy || policy.length > 4000) throw new Error('屏蔽标准应为 1–4000 个字符');
         Object.assign(settings, { apiKey: key, comments: $('#comments').checked, danmaku: $('#danmaku').checked, threshold: Number($('#threshold').value), policy });
-        GM_setValue('rbh.settings.v1', settings); restart(); fill(); note('已保存。缓存判断会复用，其他内容重新评估。');
+        GM_setValue('rbh.settings.v1', settings); restart('settings'); fill(); note('已保存。缓存判断会复用，其他内容重新评估。');
       } catch (error) { note(error.message); }
     };
-    $('#toggle').onclick = () => { settings.enabled = !settings.enabled; GM_setValue('rbh.settings.v1', settings); restart(); fill(); };
-    $('#retry').onclick = () => { restart(); note('已重试；成功判断的缓存会保留。'); };
+    $('#toggle').onclick = () => { settings.enabled = !settings.enabled; GM_setValue('rbh.settings.v1', settings); restart('toggle'); fill(); };
+    $('#retry').onclick = () => { restart('retry'); note('已重试；成功判断的缓存会保留。'); };
     $('#default-policy').onclick = () => { $('#policy').value = POLICY; };
     $('#reveal').onchange = () => { revealed = $('#reveal').checked; refreshStyles(); for (const record of commentRecords.values()) applyComment(record); };
-    $('#clear').onclick = () => { clearTimeout(saveTimer); scoreCache.clear(); GM_setValue('rbh.scores.v1', []); restart(); note('判断缓存已清空。'); };
+    $('#clear').onclick = () => { clearTimeout(saveTimer); scoreCache.clear(); GM_setValue('rbh.scores.v1', []); restart('clear-cache'); note('判断缓存已清空。'); };
+    $('#export-log').onclick = () => { exportDiagnostics(); note('已导出诊断日志。若仍有滚动异常，可把下载的 JSON 文件发来排查。'); };
     $('#history-button').onclick = () => {
       const hidden = [...commentRecords.values(), ...danmakuRecords.values()].filter(r => r.probability !== undefined && shouldHide(r.probability, settings.threshold));
       $('#history').textContent = hidden.slice(0, 100).map(r => `${r.reason || (r.probability === null ? '判断失败' : r.probability.toFixed(2))} · ${r.text}`).join('\n') || '当前没有已记录的隐藏内容。';
@@ -762,7 +829,9 @@
     renderStatus();
   }
 
-  function restart() {
+  function restart(reason = 'manual') {
+    diagnosticTotals.restarts++;
+    diagnosticEvent('restart', { reason });
     route = pageKey();
     resetJobs(); dmLoading = false; videoMeta = null;
     for (const record of commentRecords.values()) record.badge?.remove();
@@ -784,12 +853,14 @@
   function boot() {
     if (!document.documentElement) { setTimeout(boot, 0); return; }
     watchRoot(document); title = currentTitle(); route = pageKey();
+    diagnosticEvent('boot');
+    sampleLayout(); setInterval(sampleLayout, 500);
     scanComments();
     setInterval(() => {
       const nextRoute = pageKey();
       createPanel();
-      if (nextRoute !== route) { route = nextRoute; restart(); }
-      else if (pageActive() && currentTitle() !== title) restart();
+      if (nextRoute !== route) { route = nextRoute; restart('route'); }
+      else if (pageActive() && currentTitle() !== title) restart('title');
       if (pageActive()) { scanNativeDanmaku(); scanComments(); if (!videoMeta && !dmLoading && dmStatus === '等待视频') void loadDanmaku(); }
       if (panel) panel.style.display = pageActive() ? '' : 'none';
       renderStatus();

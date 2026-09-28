@@ -96,7 +96,7 @@ window.addModern = function(text, isReply = false) {
 };
 window.modernGood=addModern('这是正常的一级评论');window.modernBad=addModern('恶意回复',true);
 Object.defineProperty(document.querySelector('video'),'currentTime',{configurable:true,get(){return window.fakeTime||0;}});
-window.effectiveOpacity=function(el){let opacity=1;for(let node=el;node;node=node.parentElement){const style=getComputedStyle(node);if(style.visibility==='hidden'||style.display==='none')return 0;opacity*=Number(style.opacity);}return opacity;};
+window.effectiveOpacity=function(el){let opacity=1;for(let node=el;node;node=node.parentElement||node.getRootNode()?.host){const style=getComputedStyle(node);if(style.visibility==='hidden'||style.display==='none')return 0;opacity*=Number(style.opacity);}return opacity;};
 </script></body></html>`;
 
 async function setup(options = {}) {
@@ -190,7 +190,7 @@ test('browser: blocked roots hide replies and expand controls in legacy and Shad
     const hiddenBeforePaint = await page.evaluate(async () => {
       window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '恶意主评论';
       await new Promise(requestAnimationFrame);
-      return getComputedStyle(window.modernGood.getRootNode().host).display === 'none';
+      return effectiveOpacity(window.modernGood.getRootNode().host) === 0;
     });
     assert.equal(hiddenBeforePaint, true);
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked' && window.safeReply.dataset.rbhState === 'pending');
@@ -206,7 +206,7 @@ test('browser: blocked roots hide replies and expand controls in legacy and Shad
     // An unrecognisable replacement must not retain the old root's approval.
     await page.evaluate(() => { window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = ''; });
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'pending');
-    assert.equal(await page.locator('bili-comment-thread-renderer button').isVisible(), false);
+    assert.equal(await page.evaluate(() => effectiveOpacity(window.modernExpand)), 0);
     await page.evaluate(() => { const toggle = window.__ui.querySelector('#reveal'); toggle.checked = true; toggle.dispatchEvent(new Event('change')); });
     assert.equal(await page.locator('bili-comment-thread-renderer button').isVisible(), true);
     assert.equal(await page.locator('#legacy-expand').isVisible(), true);
@@ -493,5 +493,119 @@ test('browser: changing policy invalidates scores; changing threshold reuses the
     assert.equal(await page.evaluate(() => window.__requests.length), count);
     await page.evaluate(() => { window.__ui.querySelector('#policy').value = '隐藏所有嘲讽'; window.__ui.querySelector('#save').click(); });
     await page.waitForFunction(count => window.__requests.length > count, count);
+  } finally { await page.close(); }
+});
+
+test('browser: incidental comment updates do not collapse threads or move the scroll position after navigation', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    await page.evaluate(() => {
+      history.pushState({}, '', '/video/BV1xx411c7mD?p=2');
+      document.querySelector('h1').textContent = '新的测试视频';
+    });
+    await page.waitForFunction(() => window.__requests.some(r => r.body?.state.video_title === '新的测试视频'));
+    await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'allowed' && window.modernBad.dataset.rbhState === 'blocked');
+    await page.evaluate(() => {
+      const spacer = document.createElement('div'); spacer.style.height = '2400px'; document.body.append(spacer);
+      window.testThread = window.modernGood.getRootNode().host;
+      window.testThread.style.cssText = 'display:block;min-height:240px';
+      const counter = document.createElement('span'); counter.id = 'vote-count'; counter.textContent = '00';
+      window.modernGood.shadowRoot.append(counter);
+      const avatar = document.createElement('img'); avatar.id = 'test-avatar'; avatar.style.cssText = 'width:20px;height:20px'; avatar.alt = '头像';
+      window.modernGood.shadowRoot.append(avatar);
+      window.scrollTo(0, 500);
+    });
+    await page.waitForTimeout(200);
+    const count = await page.evaluate(() => window.__requests.length);
+    const samples = await page.evaluate(async () => {
+      const states = [];
+      const observer = new MutationObserver(mutations => states.push(...mutations.map(m => m.attributeName)));
+      observer.observe(window.testThread, { attributes: true, attributeFilter: ['data-rbh-thread'] });
+      const initial = { y: scrollY, height: document.scrollingElement.scrollHeight };
+      const samples = [];
+      for (let i = 0; i < 6; i++) {
+        const root = window.modernGood.shadowRoot;
+        root.querySelector('#vote-count').textContent = String(i).padStart(2, '0');
+        root.querySelector('#test-avatar').title = '加载状态 ' + i;
+        const content = root.querySelector('bili-rich-text').shadowRoot.querySelector('#contents span');
+        content.textContent = content.textContent; // Framework rerender with identical text.
+        const legacy = document.querySelector('#good .user-name'); legacy.title = String(i);
+        await new Promise(requestAnimationFrame);
+        samples.push({ state: window.testThread.dataset.rbhThread, y: scrollY, height: document.scrollingElement.scrollHeight });
+        await new Promise(resolve => setTimeout(resolve, 90));
+      }
+      await new Promise(resolve => setTimeout(resolve, 1100)); // Include the periodic scan.
+      observer.disconnect();
+      return { initial, samples, states };
+    });
+    assert.deepEqual(samples.states, []);
+    for (const sample of samples.samples) {
+      assert.equal(sample.state, 'allowed');
+      assert.equal(sample.height, samples.initial.height);
+      assert.ok(Math.abs(sample.y - samples.initial.y) <= 1);
+    }
+    assert.equal(await page.evaluate(() => window.__requests.length), count);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: changed comments are masked before paint while pending threads keep their space', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    const result = await page.evaluate(async () => {
+      const thread = window.modernGood.getRootNode().host;
+      thread.style.cssText = 'display:block;min-height:240px';
+      window.__apiDelay = 900;
+      const before = thread.getBoundingClientRect().height;
+      window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '恶意更新的主评论';
+      await new Promise(requestAnimationFrame);
+      return { before, after: thread.getBoundingClientRect().height, opacity: effectiveOpacity(thread), state: thread.dataset.rbhThread };
+    });
+    assert.equal(result.state, 'pending');
+    assert.equal(result.opacity, 0);
+    assert.equal(result.before, result.after);
+    await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked');
+    assert.equal(await page.evaluate(() => window.modernGood.getRootNode().host.getBoundingClientRect().height), 0);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: diagnostics download includes layout and request states but excludes private content', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    await page.evaluate(() => {
+      window.__apiStatus = 401;
+      history.pushState({}, '', '/video/BV1xx411c7mD?private=PRIVATE_URL_SENTINEL');
+      document.querySelector('h1').textContent = 'PRIVATE_TITLE_SENTINEL';
+      document.querySelector('#good .reply-content').textContent = 'PRIVATE_COMMENT_SENTINEL';
+      document.querySelector('#good .user-name').textContent = 'PRIVATE_USER_SENTINEL';
+      window.__ui.querySelector('#policy').value = 'PRIVATE_POLICY_SENTINEL';
+      window.__ui.querySelector('#save').click();
+      const spacer = document.createElement('div'); spacer.style.height = '3000px'; document.body.append(spacer);
+      window.scrollTo(0, 700);
+    });
+    await page.waitForFunction(() => window.__ui.querySelector('#status').textContent.includes('鉴权失败'));
+    const count = await page.evaluate(() => window.__requests.length);
+    const downloadPromise = page.waitForEvent('download');
+    await page.evaluate(() => window.__ui.querySelector('#export-log').click());
+    const download = await downloadPromise;
+    assert.match(download.suggestedFilename(), /^rage-bait-hider-log-\d+\.json$/);
+    const json = fs.readFileSync(await download.path(), 'utf8');
+    const report = JSON.parse(json);
+    assert.equal(report.version, '0.3.3');
+    assert.equal(report.settings.debug, false);
+    assert.ok(report.events.some(e => e.type === 'layout' && e.y === 700));
+    assert.ok(report.events.some(e => e.type === 'jev-response' && e.status === 401));
+    assert.ok(report.events.some(e => e.type === 'restart' && e.reason === 'settings'));
+    assert.ok(report.events.some(e => e.type === 'comment-state'));
+    assert.ok(report.events.length <= 1500);
+    for (const privateValue of ['fixture-key', 'PRIVATE_URL_SENTINEL', 'PRIVATE_TITLE_SENTINEL', 'PRIVATE_COMMENT_SENTINEL', 'PRIVATE_USER_SENTINEL', 'PRIVATE_POLICY_SENTINEL', '谢谢分享', '这是正常的一级评论']) {
+      assert.equal(json.includes(privateValue), false);
+    }
+    assert.equal(await page.evaluate(() => window.__requests.length), count);
+    assert.deepEqual(errors, []);
   } finally { await page.close(); }
 });
