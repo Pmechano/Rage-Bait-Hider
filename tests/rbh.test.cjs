@@ -162,7 +162,7 @@ test('browser: four emotes bypass Jev for text, image alt and native danmaku', {
     await page.waitForFunction(() => [0, 1, 2, 3].every(i => document.querySelector(`#emote-${i}`).dataset.rbhState === 'blocked' && document.querySelector(`#dm-emote-${i}`).dataset.rbhDm === 'hidden'));
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked' && document.querySelector('#good').dataset.rbhState === 'blocked');
     await page.waitForTimeout(500);
-    assert.equal(await page.locator('#good').isVisible(), false);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#good .reply-content'))), 0);
     const leaked = await page.evaluate(() => window.__requests.flatMap(r => Object.values(r.body?.state.items || {})).filter(item => /\[(星星眼|呲牙|喜极而泣|打call)\]/.test(item.target_text + item.parent_comment)));
     assert.deepEqual(leaked, []);
     await page.evaluate(() => { window.__ui.querySelector('#history-button').click(); });
@@ -190,7 +190,7 @@ test('browser: blocked roots hide replies and expand controls in legacy and Shad
     const hiddenBeforePaint = await page.evaluate(async () => {
       window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '恶意主评论';
       await new Promise(requestAnimationFrame);
-      return effectiveOpacity(window.modernGood.getRootNode().host) === 0;
+      return effectiveOpacity(window.modernGood) === 0;
     });
     assert.equal(hiddenBeforePaint, true);
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked' && window.safeReply.dataset.rbhState === 'pending');
@@ -306,7 +306,7 @@ test('browser: grey debug scores follow comment text without nicknames, extra re
 test('browser: legacy and nested Shadow DOM comments stay hidden until classified; replies include parent', { skip: !browserEnabled }, async () => {
   const { page, errors } = await setup({ apiDelay: 700 });
   try {
-    assert.equal(await page.locator('#good').isVisible(), false);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#good .reply-content'))), 0);
     await page.waitForFunction(() => document.querySelector('#good').dataset.rbhState === 'allowed');
     assert.equal(await page.locator('#good').isVisible(), true);
     assert.equal(await page.locator('#bad').isVisible(), false);
@@ -325,7 +325,7 @@ test('browser: recycled DOM text is reclassified, not trusted by its old allowed
     await page.waitForFunction(() => document.querySelector('#good').dataset.rbhState === 'allowed');
     await page.evaluate(() => { document.querySelector('#good .reply-content').textContent = '恶意替换内容'; });
     await page.waitForFunction(() => document.querySelector('#good').dataset.rbhState === 'pending');
-    assert.equal(await page.locator('#good').isVisible(), false);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#good .reply-content'))), 0);
     await page.waitForFunction(() => document.querySelector('#good').dataset.rbhState === 'blocked');
   } finally { await page.close(); }
 });
@@ -334,7 +334,7 @@ test('browser: auth failure stops new requests; comments remain hidden; pause re
   const { page } = await setup({ apiStatus: 401 });
   try {
     await page.waitForFunction(() => window.__ui?.querySelector('#status').textContent.includes('鉴权失败'));
-    assert.equal(await page.locator('#good').isVisible(), false);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#good .reply-content'))), 0);
     const count = await page.evaluate(() => window.__requests.length);
     await page.waitForTimeout(1800);
     assert.equal(await page.evaluate(() => window.__requests.length), count);
@@ -348,7 +348,7 @@ test('browser: missing answer fails closed while valid answers are usable', { sk
   const { page } = await setup({ malformed: true });
   try {
     await page.waitForFunction(() => document.querySelector('#good').dataset.rbhState === 'error');
-    assert.equal(await page.locator('#good').isVisible(), false);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#good .reply-content'))), 0);
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'allowed');
   } finally { await page.close(); }
 });
@@ -359,7 +359,7 @@ test('browser: no key means no API traffic and a visible setup prompt', { skip: 
     await page.waitForTimeout(1200);
     assert.equal(await page.evaluate(() => window.__requests.length), 0);
     assert.equal(await page.evaluate(() => window.__ui.querySelector('#box').hidden), false);
-    assert.equal(await page.locator('#good').isVisible(), false);
+    assert.equal(await page.evaluate(() => effectiveOpacity(document.querySelector('#good .reply-content'))), 0);
   } finally { await page.close(); }
 });
 
@@ -550,7 +550,7 @@ test('browser: incidental comment updates do not collapse threads or move the sc
   } finally { await page.close(); }
 });
 
-test('browser: changed comments are masked before paint while pending threads keep their space', { skip: !browserEnabled }, async () => {
+test('browser: changed comments are masked before paint with a compact pending placeholder', { skip: !browserEnabled }, async () => {
   const { page, errors } = await setup();
   try {
     await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
@@ -561,11 +561,12 @@ test('browser: changed comments are masked before paint while pending threads ke
       const before = thread.getBoundingClientRect().height;
       window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '恶意更新的主评论';
       await new Promise(requestAnimationFrame);
-      return { before, after: thread.getBoundingClientRect().height, opacity: effectiveOpacity(thread), state: thread.dataset.rbhThread };
+      return { before, after: thread.getBoundingClientRect().height, opacity: effectiveOpacity(window.modernGood), state: thread.dataset.rbhThread };
     });
     assert.equal(result.state, 'pending');
     assert.equal(result.opacity, 0);
-    assert.equal(result.before, result.after);
+    assert.ok(result.before > 32);
+    assert.equal(result.after, 32);
     await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'blocked');
     assert.equal(await page.evaluate(() => window.modernGood.getRootNode().host.getBoundingClientRect().height), 0);
     assert.deepEqual(errors, []);
@@ -595,7 +596,9 @@ test('browser: diagnostics download includes layout and request states but exclu
     assert.match(download.suggestedFilename(), /^rage-bait-hider-log-\d+\.json$/);
     const json = fs.readFileSync(await download.path(), 'utf8');
     const report = JSON.parse(json);
-    assert.equal(report.version, '0.3.3');
+    assert.equal(report.version, '0.3.4');
+    assert.equal(report.format, 2);
+    assert.ok(Array.isArray(report.comments.nodes));
     assert.equal(report.settings.debug, false);
     assert.ok(report.events.some(e => e.type === 'layout' && e.y === 700));
     assert.ok(report.events.some(e => e.type === 'jev-response' && e.status === 401));
@@ -607,5 +610,103 @@ test('browser: diagnostics download includes layout and request states but exclu
     }
     assert.equal(await page.evaluate(() => window.__requests.length), count);
     assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: long pending threads show short labels and restore themselves without scrolling', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    await page.evaluate(() => {
+      window.__apiDelay = 1000;
+      const thread = window.modernGood.getRootNode().host;
+      thread.style.cssText = 'display:block;min-height:700px';
+      window.modernGood.shadowRoot.querySelector('bili-rich-text').shadowRoot.querySelector('span').textContent = '需要等待的正常评论';
+      window.waitingExpand = document.createElement('button'); window.waitingExpand.textContent = '共 10 条回复，点击查看'; thread.shadowRoot.append(window.waitingExpand);
+    });
+    await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'pending');
+    const pending = await page.evaluate(() => {
+      const thread = window.modernGood.getRootNode().host;
+      return { height: thread.getBoundingClientRect().height, label: getComputedStyle(thread, '::after').content,
+        textOpacity: effectiveOpacity(window.modernGood), buttonOpacity: effectiveOpacity(window.waitingExpand) };
+    });
+    assert.equal(pending.height, 32);
+    assert.match(pending.label, /评论待筛选/);
+    assert.equal(pending.textOpacity, 0);
+    assert.equal(pending.buttonOpacity, 0);
+    // No wheel, scroll, click or refresh is used to reveal the finished result.
+    await page.waitForFunction(() => window.modernGood.dataset.rbhState === 'allowed');
+    assert.equal(await page.evaluate(() => effectiveOpacity(window.modernGood)), 1);
+    assert.equal(await page.evaluate(() => getComputedStyle(window.modernGood.getRootNode().host, '::after').content), 'none');
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: dispatch prioritizes newly visible comments over an existing offscreen backlog', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    const count = await page.evaluate(() => window.__requests.length);
+    await page.evaluate(() => {
+      window.__apiDelay = 700;
+      const backlog = document.createElement('div'); backlog.style.cssText = 'position:fixed;top:5000px;left:0;width:500px'; document.body.append(backlog);
+      for (let i = 0; i < 36; i++) {
+        const el = document.createElement('div'); el.className = 'reply-item';
+        el.innerHTML = '<div class="reply-content">后台等待评论 ' + i + '</div>'; backlog.append(el);
+      }
+      window.frontHost = document.createElement('div'); window.frontHost.style.cssText = 'position:fixed;top:12000px;left:0;width:500px'; document.body.append(window.frontHost);
+      window.frontComment = document.createElement('div'); window.frontComment.className = 'reply-item';
+      window.frontComment.innerHTML = '<div class="reply-content">当前屏幕优先评论</div>'; window.frontHost.append(window.frontComment);
+    });
+    await page.waitForFunction(() => window.frontComment.dataset.rbhState === 'pending');
+    await page.evaluate(() => { window.frontHost.style.top = '100px'; });
+    await page.waitForFunction(count => window.__requests.length > count, count);
+    const firstBatch = await page.evaluate(count => Object.values(window.__requests[count].body.state.items).map(item => item.target_text), count);
+    assert.ok(firstBatch.includes('当前屏幕优先评论'));
+    await page.waitForFunction(() => window.frontComment.dataset.rbhState === 'allowed');
+    assert.equal(await page.evaluate(() => effectiveOpacity(window.frontComment)), 1);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: native visibility-driven lazy comment rendering is not blocked by the pending mask', { skip: !browserEnabled }, async () => {
+  const { page, errors } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    await page.evaluate(() => {
+      const host = document.createElement('div'); host.style.cssText = 'position:fixed;top:80px;left:20px;width:600px;background:white;z-index:20';
+      const thread = document.createElement('bili-comment-thread-renderer'); thread.attachShadow({mode:'open'}); thread.style.display = 'block';
+      host.append(thread); document.querySelector('#modern').shadowRoot.append(host); window.lazyThread = thread;
+      window.lazyObserver = new IntersectionObserver(entries => {
+        if (!entries.some(entry => entry.isIntersecting && entry.isVisible) || window.lazyComment) return;
+        const item = document.createElement('bili-comment-renderer'); const root = item.attachShadow({mode:'open'});
+        root.innerHTML = '<div id="content">延迟渲染的正常评论</div>'; thread.shadowRoot.append(item); window.lazyComment = item;
+      }, {trackVisibility:true, delay:100});
+      window.lazyObserver.observe(thread);
+    });
+    await page.waitForFunction(() => window.lazyComment?.dataset.rbhState === 'allowed');
+    assert.equal(await page.evaluate(() => effectiveOpacity(window.lazyComment)), 1);
+    assert.deepEqual(errors, []);
+  } finally { await page.close(); }
+});
+
+test('browser: diagnostics distinguish parent-hidden replies and unreadable threads from model waiting', { skip: !browserEnabled }, async () => {
+  const { page } = await setup();
+  try {
+    await page.waitForFunction(() => window.modernBad.dataset.rbhState === 'blocked');
+    await page.evaluate(() => {
+      const reply = document.createElement('div'); reply.className = 'sub-reply-item'; reply.id = 'hidden-parent-reply';
+      reply.innerHTML = '<div class="reply-content">隐藏主评论下的诊断回复</div>'; document.querySelector('#bad').append(reply);
+      const empty = document.createElement('bili-comment-thread-renderer'); empty.attachShadow({mode:'open'});
+      document.querySelector('#modern').shadowRoot.append(empty);
+    });
+    await page.waitForFunction(() => document.querySelector('#hidden-parent-reply').dataset.rbhState === 'pending');
+    const downloadPromise = page.waitForEvent('download');
+    await page.evaluate(() => window.__ui.querySelector('#export-log').click());
+    const report = JSON.parse(fs.readFileSync(await (await downloadPromise).path(), 'utf8'));
+    assert.ok(report.comments.reasons['parent-hidden'] >= 1);
+    assert.ok(report.comments.unreadableThreads >= 1);
+    assert.ok(report.comments.nodes.some(node => node.reply && node.reason === 'parent-hidden'));
+    assert.equal(report.summary.queued, 0);
   } finally { await page.close(); }
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Rage Bait Hider · B站评论与弹幕
 // @namespace    local.rage-bait-hider
-// @version      0.3.3
+// @version      0.3.4
 // @updateURL    https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @downloadURL  https://raw.githubusercontent.com/Pmechano/Rage-Bait-Hider/main/rage-bait-hider.user.js
 // @description  Jev 单问题过滤：先隐藏，判断通过后显示。支持新旧评论区及普通视频弹幕。
@@ -20,7 +20,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '0.3.3';
+  const VERSION = '0.3.4';
 
   const POLICY = '包含以下任意一种就属于应屏蔽内容：引战挑衅、煽动群体对立、阴阳怪气、贬损性嘲讽、人身攻击、拉踩炫耀优越感、空洞叫嚣、无意义灌水或刷烂梗。正常讨论、真诚提问、信息分享、具体且就事论事的批评、友善玩笑以及与视频有关的普通情绪表达不属于屏蔽内容。';
   const DEFAULTS = { enabled: true, comments: true, danmaku: true, debug: false, threshold: 0.3, policy: POLICY, apiKey: '' };
@@ -142,7 +142,18 @@
     :is(${CANDIDATES}):not([data-rbh-state]),[data-rbh-state="pending"] { visibility:hidden!important; }
     [data-rbh-state="blocked"],[data-rbh-state="error"] { display:none!important; }
     [data-rbh-thread="blocked"],[data-rbh-thread="error"] { display:none!important; }
-    [data-rbh-thread="pending"] { opacity:0!important; pointer-events:none!important; }
+    [data-rbh-thread="pending"] {
+      display:block!important; position:relative!important; box-sizing:border-box!important;
+      height:32px!important; min-height:32px!important; max-height:32px!important;
+      overflow:hidden!important; visibility:visible!important; pointer-events:none!important;
+      font-size:0!important; color:transparent!important;
+    }
+    [data-rbh-thread="pending"] > *, :host([data-rbh-thread="pending"]) > * { opacity:0!important; pointer-events:none!important; }
+    [data-rbh-thread="pending"]::after {
+      content:"评论待筛选…"; position:absolute; inset:0; display:block!important;
+      visibility:visible!important; color:#888!important; font:12px/32px system-ui!important;
+      padding-left:12px; white-space:nowrap; pointer-events:none!important;
+    }
     [data-rbh-state="allowed"],[data-rbh-state="revealed"] { visibility:visible!important; }
   `;
   let generation = 0, route = '', title = '', videoMeta = null;
@@ -191,6 +202,26 @@
     const signature = JSON.stringify(layout);
     if (signature !== lastLayout) { lastLayout = signature; diagnosticEvent('layout', layout); }
   }
+  function commentDiagnostics() {
+    const nodes = [], reasons = {};
+    for (const record of commentRecords.values()) {
+      const rect = (commentThread(record.element) || record.element).getBoundingClientRect();
+      const pending = record.element.dataset.rbhState === 'pending';
+      const reason = pending ? pendingReason(record) : null;
+      if (reason) reasons[reason] = (reasons[reason] || 0) + 1;
+      nodes.push({ node: diagnosticId(record.element), reply: record.element.matches('bili-comment-reply-renderer,.sub-reply-item'),
+        state: ['pending', 'allowed', 'blocked', 'error', 'revealed'].includes(record.element.dataset.rbhState) ? record.element.dataset.rbhState : 'unset',
+        reason, ageMs: Math.max(0, Date.now() - (record.createdAt || Date.now())),
+        top: Math.round(rect.top), height: Math.round(rect.height), inViewport: rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight });
+    }
+    let unreadableThreads = 0;
+    for (const [root] of roots) for (const thread of root.querySelectorAll('bili-comment-thread-renderer[data-rbh-thread="pending"]')) {
+      const main = (thread.shadowRoot || thread).querySelector('bili-comment-renderer');
+      if (!main || !textOf(main)) unreadableThreads++;
+    }
+    nodes.sort((a, b) => Number(b.inViewport) - Number(a.inViewport) || Number(b.state === 'pending') - Number(a.state === 'pending'));
+    return { reasons, unreadableThreads, nodes: nodes.slice(0, 150), totalNodes: nodes.length };
+  }
   function exportDiagnostics() {
     sampleLayout(); diagnosticEvent('export');
     const states = { pending: 0, allowed: 0, blocked: 0, error: 0, revealed: 0, unset: 0 };
@@ -199,11 +230,11 @@
       states[Object.hasOwn(states, state) ? state : 'unset']++;
     }
     const report = {
-      format: 1, version: VERSION, exportedAt: new Date().toISOString(), sessionMs: Date.now() - logStarted,
+      format: 2, version: VERSION, exportedAt: new Date().toISOString(), sessionMs: Date.now() - logStarted,
       settings: { enabled: !!settings.enabled, comments: !!settings.comments, danmaku: !!settings.danmaku, debug: !!settings.debug, threshold: settings.threshold },
       summary: { ...diagnosticTotals, generation, comments: states, roots: roots.size, queued: queue.length,
         activeRequests, requestCount, cacheHits, cacheEntries: scoreCache.size, danmakuTexts: danmakuRecords.size },
-      events: diagnosticEvents.slice()
+      comments: commentDiagnostics(), events: diagnosticEvents.slice()
     };
     const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a'); link.dataset.rbhUi = 'true';
@@ -252,15 +283,15 @@
     clearTimeout(flushTimer);
     flushTimer = setTimeout(flush, Math.max(100, nextRequestAt - Date.now()));
   }
-  async function evaluate(item, eligible = () => true) {
+  async function evaluate(item, eligible = () => true, priority = () => 0) {
     const epoch = generation, key = await cacheKey(item);
     if (epoch !== generation || !eligible()) return undefined;
     const cached = scoreCache.get(key);
     if (cached?.expires > Date.now() && validProbability(cached.probability)) { cacheHits++; return cached.probability; }
-    if (jobs.has(key)) { const job = jobs.get(key); job.guards.add(eligible); return job.promise; }
+    if (jobs.has(key)) { const job = jobs.get(key); job.guards.add(eligible); job.priorities.add(priority); return job.promise; }
     let resolve;
     const promise = new Promise(r => { resolve = r; });
-    const job = { key, item, promise, resolve, epoch, done: false, guards: new Set([eligible]) };
+    const job = { key, item, promise, resolve, epoch, done: false, guards: new Set([eligible]), priorities: new Set([priority]) };
     jobs.set(key, job); queue.push(job); scheduleFlush();
     return promise;
   }
@@ -276,10 +307,11 @@
     if (Date.now() < nextRequestAt) { scheduleFlush(); return; }
     // Comments first; then the nearest upcoming danmaku. Other segments still get processed.
     const now = video?.currentTime || 0;
-    queue.sort((a, b) => {
-      const priority = j => j.item.type === 'comment' ? -1e9 : j.item.live ? -1e8 : ((j.item.time || 0) < now ? 1e7 : 0) + Math.abs((j.item.time || 0) - now);
-      return priority(a) - priority(b);
-    });
+    // Recompute once per dispatch, so newly visible comments overtake offscreen work.
+    const priorities = new Map(queue.map(job => [job, job.item.type === 'comment'
+      ? -1e9 + Math.min(...[...job.priorities].map(priority => priority()))
+      : job.item.live ? -1e8 : ((job.item.time || 0) < now ? 1e7 : 0) + Math.abs((job.item.time || 0) - now)]));
+    queue.sort((a, b) => priorities.get(a) - priorities.get(b));
     const batch = [];
     let chars = 0;
     while (queue.length && batch.length < 12) {
@@ -461,10 +493,31 @@
       && commentRecords.get(record.element) === record && pageKey() === route && currentTitle() === title
       && record.text === textOf(record.element) && record.parent === parentText(record.element) && parentApproved(record.element);
   }
+  function commentPriority(record) {
+    if (!record.element.isConnected) return 1e7;
+    const anchor = commentThread(record.element) || record.element;
+    const rect = anchor.getBoundingClientRect();
+    if (!rect.width || !rect.height) return 1e6;
+    const distance = Math.max(0, -rect.bottom, rect.top - innerHeight);
+    const isReply = record.element.matches('bili-comment-reply-renderer,.sub-reply-item');
+    return (distance === 0 ? 0 : 1e4 + Math.min(distance, 1e6)) + (isReply ? 100 : 0);
+  }
+  function pendingReason(record) {
+    if (!settings.apiKey) return 'no-key';
+    if (fatalError) return 'requests-stopped';
+    if (pageKey() !== route || currentTitle() !== title || record.text !== textOf(record.element) || record.parent !== parentText(record.element)) return 'stale-context';
+    if (!parentApproved(record.element)) {
+      const parent = parentComment(record.element), parentRecord = commentRecords.get(parent);
+      if (!parentRecord) return 'parent-unavailable';
+      if (parentRecord.probability !== undefined && shouldHide(parentRecord.probability, settings.threshold)) return 'parent-hidden';
+      return 'parent-pending';
+    }
+    return record.inFlight ? 'queued-or-inflight' : 'not-scheduled';
+  }
   function evaluateComment(record) {
     if (record.inFlight || record.probability !== undefined || !commentEligible(record)) return;
     record.inFlight = true;
-    engine.evaluate({ type: 'comment', text: record.text, parent: record.parent }, () => commentEligible(record)).then(probability => {
+    engine.evaluate({ type: 'comment', text: record.text, parent: record.parent }, () => commentEligible(record), () => commentPriority(record)).then(probability => {
       record.inFlight = false;
       if (record.epoch !== generation || commentRecords.get(record.element) !== record) return;
       if (commentEligible(record)) record.probability = probability;
@@ -537,7 +590,7 @@
         let record = commentRecords.get(element);
         if (record?.fingerprint === fingerprint) { applyComment(record); evaluateComment(record); continue; }
         record?.badge?.remove();
-        record = { element, fingerprint, text, parent, probability: undefined, epoch: generation };
+        record = { element, fingerprint, text, parent, probability: undefined, epoch: generation, createdAt: Date.now() };
         commentRecords.set(element, record); applyComment(record);
         const emote = blockedEmote(text) || blockedEmote(parent);
         if (emote) {
